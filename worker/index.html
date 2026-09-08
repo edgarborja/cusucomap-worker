@@ -1,0 +1,119 @@
+<meta charset="utf-8" />
+<title>CusucoMap Worker</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="./style.css" />
+
+<!--
+  The ApplicationWorker page - see worker/README.md for what this is and
+  how it fits with the rest of the repo. This tab, once started, is the
+  authoritative CusucoMap backend: it ingests Source Feed/AHK data, maintains
+  current spawn/raid/research state, and publishes to Nostr for viewers.
+  It is NOT a browser ServiceWorker (see core/logging.js and README for the
+  naming distinction the architecture explicitly calls for).
+
+  No secrets are hardcoded anywhere in this file or the modules it loads -
+  NSEC/VAPID private key are entered by the operator on the setup screen
+  below and, by default, live only in memory for this tab's lifetime.
+-->
+
+<main id="app">
+  <header class="topbar">
+    <h1>CusucoMap Worker</h1>
+    <span id="worker-npub" class="npub" hidden></span>
+  </header>
+
+  <section id="setup-screen">
+    <p class="lede">
+      This browser tab becomes the authoritative CusucoMap application worker once started. Configuration below is
+      split into two groups - <strong>public</strong> settings are safe to screenshot/share; <strong>secret</strong>
+      values are never logged and, unless you opt in below, only live in this tab's memory (re-enter them after a
+      reload).
+    </p>
+
+    <form id="setup-form">
+      <fieldset>
+        <legend>Public configuration</legend>
+
+        <label>Nostr relays (one per line)
+          <textarea id="field-relays" rows="3" placeholder="wss://relay.snort.social"></textarea>
+        </label>
+
+        <label>Tracked Source Feed channel ids (one per line)
+          <textarea id="field-source-feed-channels" rows="3" placeholder="123456789012345678"></textarea>
+        </label>
+
+        <label>Google OAuth client id <span class="hint">(not secret - this is the audience, not a credential)</span>
+          <input id="field-google-client-id" type="text" placeholder="xxxxxxxx.apps.googleusercontent.com" />
+        </label>
+
+        <label>VAPID public key
+          <input id="field-vapid-public" type="text" />
+        </label>
+
+        <label>VAPID contact
+          <input id="field-vapid-contact" type="text" placeholder="mailto:you@example.com" />
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Secret configuration</legend>
+        <p class="hint">Never logged, never published, never sent anywhere - used only locally to sign events / decrypt keys.</p>
+
+        <label>Worker NSEC
+          <input id="field-nsec" type="password" placeholder="nsec1..." autocomplete="off" />
+        </label>
+
+        <label>VAPID private key
+          <input id="field-vapid-private" type="password" autocomplete="off" />
+        </label>
+
+        <label class="checkbox">
+          <input id="field-remember-secrets" type="checkbox" />
+          Remember secrets in this browser's local storage (only do this on a machine you trust to stay dedicated to
+          this worker - anyone with access to this browser profile could read them back out).
+        </label>
+      </fieldset>
+
+      <button type="submit">Start Worker</button>
+    </form>
+    <p id="setup-error" class="error" hidden></p>
+  </section>
+
+  <section id="dashboard-screen" hidden>
+    <div class="panel">
+      <h2>Health</h2>
+      <table id="health-table"></table>
+    </div>
+
+    <div class="panel">
+      <h2>Counters</h2>
+      <table id="counters-table"></table>
+    </div>
+
+    <div class="panel">
+      <h2>Activity log</h2>
+      <ul id="activity-log"></ul>
+    </div>
+
+    <div class="panel">
+      <h2>AHK</h2>
+      <p>
+        <button id="ahk-toggle" type="button">Enable AHK</button>
+        <span id="ahk-status">Disabled</span>
+      </p>
+      <p>Send a one-off command outside the normal schedule:</p>
+      <form id="ahk-form">
+        <input id="ahk-command-input" type="text" placeholder="/pokesearch query:iv100" />
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<!--
+  Loaded as a classic global (defines window.NostrTools) rather than an npm
+  import - this worker has no bundler. Pin the version; do not silently
+  float to @latest.
+-->
+<script src="https://cdn.jsdelivr.net/npm/nostr-tools@2.25.1/lib/nostr.bundle.js"></script>
+<script type="module" src="./worker-app.js"></script>

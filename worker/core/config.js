@@ -1,0 +1,121 @@
+// Operator configuration, split hard into two objects so it's structurally
+// impossible to accidentally log/export secrets alongside public settings.
+//
+//   PublicConfig  - safe to print, screenshot, or paste into a bug report.
+//   SecretConfig  - NSEC, VAPID private key. Never displayed once entered
+//                   (see core/logging.js's redaction pass) and persisted to
+//                   localStorage only if the operator explicitly ticks
+//                   "remember secrets on this machine" on the start screen -
+//                   the default is memory-only (cleared on reload, re-enter
+//                   each time).
+//
+// This is a deliberate, visible choice per the operator, not a blanket
+// policy - see worker/index.html's start screen for the checkbox and its
+// warning copy.
+
+const PUBLIC_KEY = "cusucomap-worker:public-config:v1";
+const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if rememberSecrets is true
+
+/**
+ * @typedef {object} PublicConfig
+ * @property {string[]} relays
+ * @property {string[]} trackedChannelIds - Source Feed channel ids the bridge should scrape; pushed to the bridge over GM storage so one script install can watch any number of channels (see worker/connectors/source-feed-connector.js's #pushTrackedChannels).
+ * @property {string} googleClientId - OAuth client id (Google's own docs: this is not secret, it's the audience).
+ * @property {string} vapidPublicKey
+ * @property {string} vapidContact - "mailto:you@example.com", required by the Web Push VAPID spec.
+ * @property {boolean} rememberSecrets
+ * @property {object} ahk - AutoHotKey connector scheduling config, see defaultAhkConfig().
+ * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
+ */
+
+/** @returns {PublicConfig} */
+export function defaultPublicConfig() {
+  return {
+    relays: [],
+    trackedChannelIds: [],
+    googleClientId: "",
+    vapidPublicKey: "",
+    vapidContact: "mailto:example@example.com",
+    rememberSecrets: false,
+    ahk: defaultAhkConfig(),
+    // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
+    // tracked channel's own /geofilter setting at the time this default was
+    // captured.
+    geofilterAnchor: { lat: 13.675873, lon: -89.281163 },
+  };
+}
+
+/**
+ * Not secret, just operationally specific, so it's editable from the
+ * worker's start screen instead of requiring a code change to retune. No
+ * "AHK::" prefix on these - see worker-bridge/README.md and the companion
+ * script's AHK PROTOCOL comment; the AHK script takes the command text
+ * as-is over HTTP.
+ */
+export function defaultAhkConfig() {
+  return {
+    scheduledSearches: [
+      "/pokesearch query:iv100",
+      "/pokesearch query:iv95",
+      "/pokesearch query:0/0/0",
+      "/pokesearch query:cp2500",
+      "/pokesearch query:xxl",
+      "/pokesearch query:unown",
+      "/pokesearch query:audino",
+      "/pokesearch query:azelf",
+      "/pokesearch query:ditto",
+      "/pokesearch query:lvl35",
+      "/pokesearch query:lvl31 iv65",
+    ],
+    searchPauseMinS: 8,
+    searchPauseMaxS: 15,
+    batchRestMinMin: 2,
+    batchRestMaxMin: 3,
+    dailyCommands: [
+      { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel channel:#your-channel-name" },
+      { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel channel:#your-channel-name" },
+    ],
+  };
+}
+
+/**
+ * @typedef {object} SecretConfig
+ * @property {string} nsec
+ * @property {string} vapidPrivateKey
+ */
+
+export function defaultSecretConfig() {
+  return { nsec: "", vapidPrivateKey: "" };
+}
+
+export function loadPublicConfig() {
+  try {
+    const raw = localStorage.getItem(PUBLIC_KEY);
+    return raw ? { ...defaultPublicConfig(), ...JSON.parse(raw) } : defaultPublicConfig();
+  } catch {
+    return defaultPublicConfig();
+  }
+}
+
+export function savePublicConfig(config) {
+  localStorage.setItem(PUBLIC_KEY, JSON.stringify(config));
+}
+
+/** Secrets are only ever read from localStorage if a previous session opted in. */
+export function loadSecretConfig() {
+  try {
+    const raw = localStorage.getItem(SECRET_KEY);
+    return raw ? { ...defaultSecretConfig(), ...JSON.parse(raw) } : defaultSecretConfig();
+  } catch {
+    return defaultSecretConfig();
+  }
+}
+
+/** Only call this when the operator has explicitly opted into on-disk persistence. */
+export function saveSecretConfig(secrets) {
+  localStorage.setItem(SECRET_KEY, JSON.stringify(secrets));
+}
+
+export function clearPersistedSecrets() {
+  localStorage.removeItem(SECRET_KEY);
+}
