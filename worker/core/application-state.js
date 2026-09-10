@@ -108,11 +108,16 @@ class PushSubscriptionStore {
   constructor(collection) {
     this.#collection = collection;
   }
+  // Keyed by the device's own Nostr pubkey, not its Web Push endpoint - see
+  // shared/notifications.md section 4.
+  async get(nostrPubkey) {
+    return this.#collection.get(nostrPubkey);
+  }
   async put(subscription) {
     return this.#collection.put(subscription);
   }
-  async delete(endpoint) {
-    return this.#collection.delete(endpoint);
+  async delete(nostrPubkey) {
+    return this.#collection.delete(nostrPubkey);
   }
   async all() {
     return this.#collection.getAll();

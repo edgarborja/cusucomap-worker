@@ -7,7 +7,7 @@
 // worker/index.html defines the global `NostrTools`, since this worker has
 // no bundler to `import "nostr-tools"` from npm the way cusucomap-viewer's
 // Vite build does.
-import { RELAYS, buildEntityEventTemplate, KIND_WORKER_STATUS } from "../../shared/nostr-protocol.js";
+import { RELAYS, buildEntityEventTemplate, buildWorkerConfigEventTemplate, KIND_WORKER_STATUS } from "../../shared/nostr-protocol.js";
 
 function nostrTools() {
   if (!window.NostrTools) {
@@ -147,6 +147,18 @@ export class NostrTransport {
     return this.#publishTemplate(buildEntityEventTemplate(kind, id, expiresAtIso, content), label ?? `entity ${id}`);
   }
 
+  /**
+   * Plaintext, addressable worker-wide public config (currently just the
+   * VAPID public key) - see PROTOCOL.md's kind 31505. Deliberately not part
+   * of publishWorkerStatus: that republishes every 60s regardless of
+   * activity, but this practically never changes, so it's published once
+   * at startup instead (see worker-app.js) rather than re-versioned on
+   * every status heartbeat.
+   */
+  async publishWorkerConfig(content) {
+    return this.#publishTemplate(buildWorkerConfigEventTemplate(content), "worker config");
+  }
+
   /** Replaceable worker-presence event a viewer/dashboard could read without an RPC round trip. */
   async publishWorkerStatus(status) {
     return this.#publishTemplate(
@@ -174,10 +186,16 @@ export class NostrTransport {
 
   /**
    * Subscribes to encrypted events of `kind` addressed to this worker (a `p`
-   * tag matching our own pubkey). Calls `onMessage({ fromPubkey, data })`
-   * with the decoded plaintext object once decrypted - a message that fails
-   * to decrypt (wrong key, malformed) is logged and dropped, never thrown
-   * into the caller.
+   * tag matching our own pubkey). Calls
+   * `onMessage({ fromPubkey, eventId, createdAt, data })` with the decoded
+   * plaintext object once decrypted - a message that fails to decrypt
+   * (wrong key, malformed) is logged and dropped, never thrown into the
+   * caller. `createdAt` (unix seconds, straight from the event) lets a
+   * consumer of an addressable kind ignore a stale/replayed copy older than
+   * what it already has for that sender - the ephemeral RPC kinds don't
+   * need this (they use eventId-based replay protection instead, see
+   * transports/rpc.js), but an addressable kind's "latest wins" semantics
+   * do.
    */
   subscribeEncrypted(kind, onMessage) {
     const NT = nostrTools();
@@ -191,7 +209,7 @@ export class NostrTransport {
           try {
             const conversationKey = NT.nip44.v2.utils.getConversationKey(this.#secretKey, event.pubkey);
             const plaintext = NT.nip44.v2.decrypt(event.content, conversationKey);
-            onMessage({ fromPubkey: event.pubkey, eventId: event.id, data: JSON.parse(plaintext) });
+            onMessage({ fromPubkey: event.pubkey, eventId: event.id, createdAt: event.created_at, data: JSON.parse(plaintext) });
           } catch (err) {
             this.#logger?.warn("nostr", `dropped undecryptable/malformed event ${event.id.slice(0, 8)}: ${err.message}`);
           }

@@ -27,6 +27,29 @@ export const KIND_RPC_RESPONSE = 29501;
 // "worker last seen Ns ago" without needing a request/response round trip.
 export const KIND_WORKER_STATUS = 31503;
 
+// Addressable (NIP-33), d="config", one per device pubkey - a device's
+// current Web Push notification state (subscription + preferences),
+// NIP-44 encrypted to the worker's pubkey and published BY THE DEVICE
+// (browser/viewer side, not this repo). Deliberately NOT in the ephemeral
+// RPC range: KIND_RPC_REQUEST/RESPONSE aren't retained by relays, so a
+// device's registration sent while the worker was offline would be lost
+// forever - the whole point of this being addressable is that the worker
+// can reconnect later and recover the latest state per device straight
+// from the relay, no simultaneous-online requirement. See
+// shared/notifications.md section 1 for the full reasoning (agreed by
+// both the worker and viewer agents).
+export const KIND_DEVICE_NOTIFY_CONFIG = 31504;
+
+// Addressable (NIP-33), d="config" - worker-wide public configuration a
+// viewer needs before it can register for push (currently just the VAPID
+// public key). Plaintext content: none of this is sensitive, it's the
+// public half of the VAPID keypair. Deliberately its OWN kind rather than
+// a field on KIND_WORKER_STATUS: status republishes every 60s regardless
+// of activity, but this practically never changes - coupling them would
+// mean every status heartbeat re-versions a field it doesn't conceptually
+// own (see shared/notifications.md section 5).
+export const KIND_WORKER_CONFIG = 31505;
+
 export const PROTOCOL_VERSION = 1;
 
 /**
@@ -69,6 +92,22 @@ export function buildEntityEventTemplate(kind, id, expiresAtIso, entity, created
 
 export function dTag(event) {
   return event.tags.find((tag) => tag[0] === "d")?.[1] ?? null;
+}
+
+/**
+ * Builds the addressable, plaintext KIND_WORKER_CONFIG event template - the
+ * worker's own public config (currently just the VAPID public key) that a
+ * viewer needs before it can register for push. Not encrypted: nothing in
+ * `content` is sensitive.
+ * @param {{ vapidPublicKey: string | null }} content
+ */
+export function buildWorkerConfigEventTemplate(content, createdAt = Math.floor(Date.now() / 1000)) {
+  return {
+    kind: KIND_WORKER_CONFIG,
+    created_at: createdAt,
+    tags: [["d", "config"]],
+    content: JSON.stringify(content),
+  };
 }
 
 /**

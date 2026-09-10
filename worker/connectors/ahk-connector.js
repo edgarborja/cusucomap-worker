@@ -26,6 +26,11 @@ export class AhkConnector {
   #ahkTransport;
   #batchTimer = null;
   #dailyCheckTimer = null;
+  // start()/stop() only arm/disarm the *outer* timers - a batch or daily
+  // check already mid-loop (sleeping between queued sends) has no other way
+  // to notice it was disabled, so every loop below re-checks this flag
+  // before each send/continuation rather than relying on the timers alone.
+  #running = false;
 
   /**
    * @param {() => import("../core/config.js").PublicConfig["ahk"]} getConfig - lazy accessor, so an operator config edit takes effect on the next cycle without a restart.
@@ -40,11 +45,13 @@ export class AhkConnector {
   }
 
   start() {
+    this.#running = true;
     this.#runScheduledBatch();
     this.#dailyCheckTimer = setInterval(() => this.#checkDailyCommands().catch((err) => this.#logger.error("ahk", err.message)), 60_000);
   }
 
   stop() {
+    this.#running = false;
     clearTimeout(this.#batchTimer);
     clearInterval(this.#dailyCheckTimer);
   }
@@ -63,9 +70,12 @@ export class AhkConnector {
   async #runScheduledBatch() {
     const config = this.#getConfig();
     for (const message of config.scheduledSearches) {
+      if (!this.#running) return;
       await this.#send(message);
+      if (!this.#running) return;
       await sleep(randomInt(config.searchPauseMinS, config.searchPauseMaxS) * 1000);
     }
+    if (!this.#running) return;
     const restMs = randomInt(config.batchRestMinMin, config.batchRestMaxMin) * 60_000;
     this.#batchTimer = setTimeout(() => this.#runScheduledBatch(), restMs);
   }
@@ -75,6 +85,7 @@ export class AhkConnector {
     const today = todayKey();
     const now = Date.now();
     for (const cmd of config.dailyCommands) {
+      if (!this.#running) return;
       const sentKey = `ahkDailyCommandSent:${cmd.label}:${today}`;
       if (await this.#state.workerMetadata.get(sentKey, false)) continue;
 
@@ -89,6 +100,7 @@ export class AhkConnector {
       }
 
       if (now >= targetMs) {
+        if (!this.#running) return;
         await this.#send(cmd.message);
         await this.#state.workerMetadata.set(sentKey, true);
         this.#logger.info("ahk", `sent daily command "${cmd.label}"`);

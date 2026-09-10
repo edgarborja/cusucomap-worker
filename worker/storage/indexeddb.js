@@ -5,7 +5,7 @@
 // could be swapped later without touching services/connectors.
 
 const DB_NAME = "cusucomap-worker";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 /** @type {Record<string, { keyPath: string, indexes?: [string, string, IDBIndexParameters?][] }>} */
 const STORE_DEFS = {
@@ -13,7 +13,12 @@ const STORE_DEFS = {
   raids: { keyPath: "id" },
   fieldResearch: { keyPath: "id" },
   users: { keyPath: "userId" },
-  pushSubscriptions: { keyPath: "endpoint", indexes: [["byUser", "userId", { unique: false }]] },
+  // Keyed by the device's own Nostr pubkey, not its Web Push endpoint - an
+  // endpoint can rotate (browser replaces the PushSubscription) but the
+  // device identity doesn't, so a new KIND_DEVICE_NOTIFY_CONFIG event from
+  // the same device replaces its one row instead of leaving an orphaned
+  // row under the old endpoint. See shared/notifications.md section 4.
+  pushSubscriptions: { keyPath: "nostrPubkey", indexes: [["byUser", "userId", { unique: false }], ["byEndpoint", "endpoint", { unique: false }]] },
   // Dedup guard for inbound Nostr RPC requests (replay protection) - see
   // worker/transports/rpc.js. Pruned on a timer, not kept forever.
   processedEvents: { keyPath: "eventId" },
@@ -25,8 +30,16 @@ const STORE_DEFS = {
 function openDb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (event) => {
       const db = req.result;
+      // v1 -> v2: pushSubscriptions moved from keyPath "endpoint" to
+      // "nostrPubkey" (see STORE_DEFS above). No live data ever existed
+      // under the old shape - nothing wrote to this store before this
+      // version (see shared/notifications.md) - so drop-and-recreate is
+      // safe; a real migration would copy rows across instead.
+      if (event.oldVersion < 2 && db.objectStoreNames.contains("pushSubscriptions")) {
+        db.deleteObjectStore("pushSubscriptions");
+      }
       for (const [name, def] of Object.entries(STORE_DEFS)) {
         if (db.objectStoreNames.contains(name)) continue;
         const store = db.createObjectStore(name, { keyPath: def.keyPath });

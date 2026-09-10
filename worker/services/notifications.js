@@ -1,38 +1,59 @@
-// Decides who gets a Web Push notification and sends it. Preference
-// matching: species alert OR any alerted type, one notification even if
-// both match - evaluated against IndexedDB subscriptions, sent via
-// services/push-sender.js + a PushTransport instead of the `web-push` npm
-// package.
+// Decides who gets a Web Push notification and sends it, and owns the
+// device-side registration/preferences state behind that decision.
+// Preference matching: IV alert OR species alert OR any alerted type, one
+// notification even if several match - evaluated against IndexedDB
+// subscriptions, sent via services/push-sender.js + a PushTransport
+// instead of the `web-push` npm package. Registration state arrives as
+// KIND_DEVICE_NOTIFY_CONFIG (addressable, NIP-44 encrypted, published by
+// the device) rather than an RPC call - see shared/notifications.md
+// section 1 for why the ephemeral RPC kinds can't satisfy "recover state
+// after reconnecting."
 import { createWebPushRequest } from "./push-sender.js";
+import { KIND_DEVICE_NOTIFY_CONFIG } from "../../shared/nostr-protocol.js";
 
 function normalize(text) {
   return String(text).trim().toLowerCase();
 }
 
-/** True if `preferences` should fire for a spawn of this species/types. Exported for unit testing. */
-export function matchesSpawnAlert(preferences, species, types) {
+/**
+ * True if `preferences` should fire for a spawn with this species/types/IV.
+ * `preferences.ivPerfect` defaults to true (unset, not `false`) - V1
+ * behavior is "every enabled device gets notified on a 100% IV spawn"
+ * regardless of species/type configuration (see shared/notifications.md
+ * section 3); an explicit `false` is how a device opts out of just that
+ * category once more preference categories exist. Exported for unit
+ * testing.
+ */
+export function matchesSpawnAlert(preferences, species, types, ivPercent) {
   const speciesSet = new Set((preferences.species ?? []).map(normalize));
   const typeSet = new Set((preferences.types ?? []).map(normalize));
   const matchedTypes = (types ?? []).filter((t) => typeSet.has(normalize(t)));
-  return { isMatch: speciesSet.has(normalize(species)) || matchedTypes.length > 0, matchedTypes };
+  const ivMatch = preferences.ivPerfect !== false && ivPercent === 100;
+  return { isMatch: ivMatch || speciesSet.has(normalize(species)) || matchedTypes.length > 0, matchedTypes, ivMatch };
 }
 
 export class NotificationsService {
   #state;
   #bus;
+  #transport;
   #pushTransport;
   #getVapidConfig;
   #logger;
 
   /**
    * @param {object} deps
+   * @param {import("../transports/nostr-transport.js").NostrTransport} deps.transport
+   *   Used to subscribe for KIND_DEVICE_NOTIFY_CONFIG - the Nostr side, not
+   *   pushTransport (which only sends the already-built Web Push HTTP
+   *   request).
    * @param {() => { vapidPublicKey: string, vapidPrivateKey: string, contact: string } | null} deps.getVapidConfig
    *   Lazy accessor (not a captured value) so a config change/Start Worker
    *   after construction is picked up without re-wiring this service.
    */
-  constructor({ state, bus, pushTransport, getVapidConfig, logger }) {
+  constructor({ state, bus, transport, pushTransport, getVapidConfig, logger }) {
     this.#state = state;
     this.#bus = bus;
+    this.#transport = transport;
     this.#pushTransport = pushTransport;
     this.#getVapidConfig = getVapidConfig;
     this.#logger = logger;
@@ -40,6 +61,9 @@ export class NotificationsService {
 
   start() {
     this.#bus.on("spawn.created", ({ entity }) => this.#notifySpawn(entity));
+    this.#transport.subscribeEncrypted(KIND_DEVICE_NOTIFY_CONFIG, (msg) =>
+      this.#handleDeviceConfig(msg).catch((err) => this.#logger.error("push", `device config handling threw: ${err.message}`))
+    );
   }
 
   async #notifySpawn(spawn) {
@@ -48,7 +72,7 @@ export class NotificationsService {
 
     const subscriptions = await this.#state.pushSubscriptions.all();
     for (const sub of subscriptions) {
-      const { isMatch, matchedTypes } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? []);
+      const { isMatch, matchedTypes } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
       if (!isMatch) continue;
       const typeSuffix = matchedTypes.length > 0 && !sub.preferences.species?.some((s) => normalize(s) === normalize(spawn.species))
         ? ` (${matchedTypes.map((t) => t[0].toUpperCase() + t.slice(1)).join("/")} alert)`
@@ -71,8 +95,14 @@ export class NotificationsService {
         await this.#state.workerMetadata.increment("pushesSent");
       } else if (result.status === 404 || result.status === 410) {
         // Permanently invalid endpoint (browser uninstalled/subscription
-        // expired) - per the reliability brief, remove rather than retry.
-        await this.#state.pushSubscriptions.delete(subscription.endpoint);
+        // expired, or the browser rotated it without the device managing to
+        // publish an updated KIND_DEVICE_NOTIFY_CONFIG yet) - per the
+        // reliability brief, remove rather than retry. Keyed by the
+        // device's own pubkey, not the now-dead endpoint (see
+        // shared/notifications.md section 4) - this is also how a device
+        // that vanished (site data cleared, no way to tell the worker
+        // directly) eventually gets cleaned up, per that section's addendum.
+        await this.#state.pushSubscriptions.delete(subscription.nostrPubkey);
         this.#logger.info("push", `removed invalid subscription (HTTP ${result.status}): ${subscription.endpoint.slice(0, 60)}…`);
       } else {
         await this.#state.workerMetadata.increment("pushErrors");
@@ -84,32 +114,55 @@ export class NotificationsService {
     }
   }
 
-  /** RPC handler: viewer enables/updates push notifications. */
-  async updateNotificationPreferences({ subscription, preferences }, { fromPubkey }) {
-    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
-      throw new Error("subscription.{endpoint, keys.p256dh, keys.auth} are required.");
+  /**
+   * Handles one decrypted KIND_DEVICE_NOTIFY_CONFIG event - a device's full
+   * current notification state (see shared/notifications.md section 1 for
+   * the wire shape). `fromPubkey` is the device's identity; its signature
+   * on this event (already verified before this method runs - see
+   * NostrTransport#subscribeEncrypted) is the only authentication needed,
+   * so a device can only ever update its own row.
+   */
+  async #handleDeviceConfig({ fromPubkey, createdAt, data }) {
+    if (!data || typeof data !== "object") {
+      this.#logger.warn("push", `dropped malformed device config from ${fromPubkey.slice(0, 8)}…`);
+      return;
     }
+
+    // NIP-33 "latest wins": a relay should only ever hand us the newest
+    // event per (kind, pubkey, d), but not every relay is perfectly
+    // compliant and a subscription spanning several relays can otherwise
+    // race - compare against what's already stored so an older duplicate
+    // can't undo a newer change.
+    const existing = await this.#state.pushSubscriptions.get(fromPubkey);
+    if (existing && createdAt <= existing.sourceCreatedAt) {
+      this.#logger.warn("push", `ignored stale/replayed device config from ${fromPubkey.slice(0, 8)}…`);
+      return;
+    }
+
+    if (!data.enabled) {
+      await this.#state.pushSubscriptions.delete(fromPubkey);
+      return;
+    }
+
+    const { subscription, preferences } = data;
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+      this.#logger.warn("push", `dropped device config from ${fromPubkey.slice(0, 8)}… - invalid subscription shape`);
+      return;
+    }
+
     const user = await this.#state.users.findByIdentity("nostr", fromPubkey);
     await this.#state.pushSubscriptions.put({
+      nostrPubkey: fromPubkey,
       endpoint: subscription.endpoint,
       keys: subscription.keys,
       userId: user?.userId ?? null,
-      nostrPubkey: fromPubkey,
-      preferences: { species: preferences?.species ?? [], types: preferences?.types ?? [] },
+      preferences: {
+        ivPerfect: preferences?.ivPerfect !== false,
+        species: preferences?.species ?? [],
+        types: preferences?.types ?? [],
+      },
       updatedAt: Date.now(),
+      sourceCreatedAt: createdAt,
     });
-    return { ok: true };
-  }
-
-  /** RPC handler: viewer disables push notifications on this device. */
-  async disableNotifications({ endpoint }) {
-    if (typeof endpoint !== "string") throw new Error("endpoint is required.");
-    await this.#state.pushSubscriptions.delete(endpoint);
-    return { ok: true };
-  }
-
-  registerRpc(rpc) {
-    rpc.handle("updateNotificationPreferences", (params, ctx) => this.updateNotificationPreferences(params, ctx));
-    rpc.handle("disableNotifications", (params, ctx) => this.disableNotifications(params, ctx));
   }
 }

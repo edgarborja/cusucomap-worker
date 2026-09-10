@@ -141,6 +141,7 @@ async function startWorker(publicConfig, secretConfig) {
   const notifications = new NotificationsService({
     state,
     bus,
+    transport,
     pushTransport,
     getVapidConfig: () =>
       publicConfig.vapidPublicKey && secretConfig.vapidPrivateKey
@@ -154,7 +155,6 @@ async function startWorker(publicConfig, secretConfig) {
 
   const rpc = new Rpc({ transport, state, logger });
   accounts.registerRpc(rpc);
-  notifications.registerRpc(rpc);
   rpc.handle("getSnapshot", async () => ({
     spawns: await state.spawns.active(),
     raids: await state.raids.active(),
@@ -164,6 +164,12 @@ async function startWorker(publicConfig, secretConfig) {
 
   wireNostrPublishing(bus, transport, logger);
   await republishAllActive(state, transport, logger);
+  // Once at startup, not on the 60s status heartbeat - see
+  // NostrTransport#publishWorkerConfig. `null` tells a viewer push
+  // registration isn't available rather than erroring.
+  await transport
+    .publishWorkerConfig({ vapidPublicKey: publicConfig.vapidPublicKey ?? null })
+    .catch((err) => logger.error("nostr", `worker config publish failed: ${err.message}`));
 
   setInterval(() => {
     transport
