@@ -15,6 +15,15 @@ function normalize(text) {
   return String(text).trim().toLowerCase();
 }
 
+/** "2:34pm" - lowercase, no leading zero on the hour, no space before am/pm. */
+function formatDespawnTime(despawnAtIso) {
+  const d = new Date(despawnAtIso);
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const period = d.getHours() >= 12 ? "pm" : "am";
+  const hour = d.getHours() % 12 || 12;
+  return `${hour}:${minutes}${period}`;
+}
+
 /**
  * True if `preferences` should fire for a spawn with this species/types/IV.
  * `preferences.ivPerfect` defaults to true (unset, not `false`) - V1
@@ -89,13 +98,19 @@ export class NotificationsService {
       // the species so it reads cleanly in the notification's own bold
       // header line; 💯 only for an actual 100%-IV match, not a
       // species/type-only alert.
+      const headline = ivMatch ? `¡${spawn.species} 💯 detectado!` : `¡${spawn.species} detectado!`;
       const outcome = await this.#send(sub, {
         title: spawn.species,
-        body: ivMatch ? `¡${spawn.species} 💯 detectado!` : `¡${spawn.species} detectado!`,
+        body: `${headline} Hasta las ${formatDespawnTime(spawn.despawnAt)}`,
         // Per-notification large icon (right-side image on Android) - the
         // species' own sprite instead of a static app icon. sw.js falls
         // back to the app icon if this is missing/fails to load.
         icon: spawn.spriteUrl ?? null,
+        // Read by sw.js: tag dedupes a re-notification for the same spawn
+        // (replaces instead of stacking), url deep-links into the viewer -
+        // format confirmed against the viewer's actual query param.
+        tag: String(spawn.id),
+        url: `https://cusucomap.com/?spawn=${spawn.id}`,
         entityType: "spawn",
         entityId: spawn.id,
       });
