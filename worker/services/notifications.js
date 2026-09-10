@@ -70,10 +70,16 @@ export class NotificationsService {
     const vapid = this.#getVapidConfig();
     if (!vapid) return; // Web Push not configured - silently skip, dashboard already shows VAPID as not-ready
 
+    // TEMPORARY TEST HOOK - remove after notification testing is done.
+    // Forces a match on this exact, deliberately-unlikely IV spread so
+    // end-to-end push testing doesn't have to wait hours for a real 100%
+    // IV spawn. Matches regardless of a subscription's own preferences.
+    const isTestTarget = normalize(spawn.species) === "weedle" && spawn.ivSpread?.atk === 10 && spawn.ivSpread?.def === 5 && spawn.ivSpread?.sta === 15;
+
     const subscriptions = await this.#state.pushSubscriptions.all();
     for (const sub of subscriptions) {
       const { isMatch, matchedTypes } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
-      if (!isMatch) continue;
+      if (!isMatch && !isTestTarget) continue;
       const typeSuffix = matchedTypes.length > 0 && !sub.preferences.species?.some((s) => normalize(s) === normalize(spawn.species))
         ? ` (${matchedTypes.map((t) => t[0].toUpperCase() + t.slice(1)).join("/")} alert)`
         : "";
