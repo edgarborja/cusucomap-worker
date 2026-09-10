@@ -91,7 +91,7 @@ export class NotificationsService {
     // Forces a match on this exact, deliberately-unlikely IV spread so
     // end-to-end push testing doesn't have to wait hours for a real 100%
     // IV spawn. Matches regardless of a subscription's own preferences.
-    const isTestTarget = normalize(spawn.species) === "pidgey" && spawn.ivSpread?.atk === 10 && spawn.ivSpread?.def === 2 && spawn.ivSpread?.sta === 0;
+    const isTestTarget = normalize(spawn.species) === "pidgey" && spawn.ivSpread?.atk === 1 && spawn.ivSpread?.def === 10 && spawn.ivSpread?.sta === 4;
 
     const subscriptions = await this.#state.pushSubscriptions.all();
     let sent = 0;
