@@ -107,6 +107,17 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#setup-status {
+  margin-left: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
 .error {
   color: var(--error);
 }

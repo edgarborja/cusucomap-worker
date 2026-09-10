@@ -106,9 +106,18 @@ function wireAhkControls({ ahkConnector, logger }) {
 /** Re-broadcasts everything currently active on startup - a relay that pruned an entity while the worker was offline (or a newly-added relay with no history at all) still converges to the correct current state. */
 async function republishAllActive(state, transport, logger) {
   const [spawns, raids, research] = await Promise.all([state.spawns.active(), state.raids.active(), state.fieldResearch.active()]);
-  for (const s of spawns) await transport.publishEntity(KIND_SPAWN, s.id, s.despawnAt, s, `spawn ${s.species} (resync)`);
-  for (const r of raids) await transport.publishEntity(KIND_RAID, r.id, r.endsAt, r, `raid ${r.bossSpecies ?? "?"} (resync)`);
-  for (const q of research) await transport.publishEntity(KIND_QUEST, q.id, q.expiresAt, q, `quest ${q.rewardName} (resync)`);
+  // Concurrent, not one-at-a-time: each publishEntity() call is its own
+  // relay round trip, and #publishTemplate already resolves (never
+  // rejects) via Promise.allSettled internally, so there's nothing here
+  // for one slow/failed entity to block behind. On a worker with many
+  // active entities this is most of what made Start Worker take up to
+  // ~30s - now it's roughly one round-trip's worth of wall-clock time
+  // for the whole batch instead of N of them back to back.
+  await Promise.all([
+    ...spawns.map((s) => transport.publishEntity(KIND_SPAWN, s.id, s.despawnAt, s, `spawn ${s.species} (resync)`)),
+    ...raids.map((r) => transport.publishEntity(KIND_RAID, r.id, r.endsAt, r, `raid ${r.bossSpecies ?? "?"} (resync)`)),
+    ...research.map((q) => transport.publishEntity(KIND_QUEST, q.id, q.expiresAt, q, `quest ${q.rewardName} (resync)`)),
+  ]);
   logger.info("worker", `resynced ${spawns.length} spawns, ${raids.length} raids, ${research.length} quests on startup`);
 }
 
@@ -238,6 +247,7 @@ function main() {
   const errorEl = document.getElementById("setup-error");
   const setupForm = document.getElementById("setup-form");
   const submitButton = setupForm.querySelector('button[type="submit"]');
+  const statusEl = document.getElementById("setup-status");
   // startWorker() awaits a lot of network I/O (republishAllActive, etc.)
   // before the setup screen ever gets hidden below - a second click/Enter
   // in that window used to run the whole thing twice, standing up two
@@ -254,6 +264,13 @@ function main() {
     starting = true;
     submitButton.disabled = true;
     errorEl.hidden = true;
+    // startWorker() mostly waits on relay round trips - connecting, then
+    // republishAllActive() re-publishing every currently-active spawn/raid/
+    // quest one at a time - which is why this can take up to ~30s on a
+    // worker with a lot of active entities. Not a log, just enough to say
+    // the button press registered and something is actually happening.
+    statusEl.textContent = "Connecting to relays and syncing active spawns/raids/quests…";
+    statusEl.hidden = false;
     const { publicConfig, secretConfig } = readSetupForm();
 
     if (!secretConfig.nsec) {
@@ -261,6 +278,7 @@ function main() {
       errorEl.hidden = false;
       starting = false;
       submitButton.disabled = false;
+      statusEl.hidden = true;
       return;
     }
 
@@ -281,6 +299,7 @@ function main() {
       errorEl.hidden = false;
       starting = false;
       submitButton.disabled = false;
+      statusEl.hidden = true;
     }
   });
 }
