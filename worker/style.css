@@ -118,6 +118,11 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+#build-date {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .error {
   color: var(--error);
 }
