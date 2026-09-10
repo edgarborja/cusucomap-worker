@@ -24,7 +24,6 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
  * @property {string} vapidPublicKey
  * @property {string} vapidContact - "mailto:you@example.com", required by the Web Push VAPID spec.
  * @property {boolean} rememberSecrets
- * @property {object} ahk - AutoHotKey connector scheduling config, see defaultAhkConfig().
  * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
  */
 
@@ -37,7 +36,6 @@ export function defaultPublicConfig() {
     vapidPublicKey: "",
     vapidContact: "mailto:example@example.com",
     rememberSecrets: false,
-    ahk: defaultAhkConfig(),
     // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
     // tracked channel's own /geofilter setting at the time this default was
     // captured.
@@ -46,34 +44,37 @@ export function defaultPublicConfig() {
 }
 
 /**
- * Not secret, just operationally specific, so it's editable from the
- * worker's start screen instead of requiring a code change to retune. No
- * "AHK::" prefix on these - see worker-bridge/README.md and the companion
- * script's AHK PROTOCOL comment; the AHK script takes the command text
- * as-is over HTTP.
+ * AutoHotKey connector scheduling config. Deliberately NOT part of
+ * PublicConfig/persisted to localStorage - there's no setup-screen field
+ * that ever lets the operator edit this, so routing it through saved
+ * config only meant a stale copy could silently outlive a code update
+ * (the operator would have to redo the setup form, which happens to
+ * regenerate this fresh, for a fix to actually take effect). Called
+ * directly wherever needed instead, so it's just page code - a plain
+ * reload always picks up the current value, no persistence layer involved.
  */
 export function defaultAhkConfig() {
   return {
     scheduledSearches: [
-      "/pokesearch query:iv100",
-      "/pokesearch query:iv95",
-      "/pokesearch query:0/0/0",
-      "/pokesearch query:cp2500",
-      "/pokesearch query:xxl",
-      "/pokesearch query:unown",
-      "/pokesearch query:audino",
-      "/pokesearch query:azelf",
-      "/pokesearch query:ditto",
-      "/pokesearch query:lvl35",
-      "/pokesearch query:lvl31 iv65",
+      "/pokesearch iv100",
+      "/pokesearch iv95",
+      "/pokesearch 0/0/0",
+      "/pokesearch cp2500",
+      "/pokesearch xxl",
+      "/pokesearch unown",
+      "/pokesearch audino",
+      "/pokesearch azelf",
+      "/pokesearch ditto",
+      "/pokesearch lvl35",
+      "/pokesearch lvl31 iv65",
     ],
     searchPauseMinS: 8,
     searchPauseMaxS: 15,
     batchRestMinMin: 2,
     batchRestMaxMin: 3,
     dailyCommands: [
-      { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel channel:#your-channel-name" },
-      { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel channel:#your-channel-name" },
+      { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel" },
+      { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel" },
     ],
   };
 }

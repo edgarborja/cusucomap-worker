@@ -33,7 +33,7 @@ export class AhkConnector {
   #running = false;
 
   /**
-   * @param {() => import("../core/config.js").PublicConfig["ahk"]} getConfig - lazy accessor, so an operator config edit takes effect on the next cycle without a restart.
+   * @param {typeof import("../core/config.js").defaultAhkConfig} getConfig - lazy accessor (not a captured value), so a code change to defaultAhkConfig() takes effect on the next cycle without a restart - see that function's own comment for why this isn't part of PublicConfig.
    * @param {import("../transports/ahk-transport.js").AhkTransport} ahkTransport
    */
   constructor({ bus, logger, state, getConfig, ahkTransport }) {

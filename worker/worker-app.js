@@ -134,7 +134,7 @@ async function startWorker(publicConfig, secretConfig) {
   sourceFeedConnector.start();
 
   const ahkTransport = new AhkTransport();
-  const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: () => publicConfig.ahk ?? defaultAhkConfig(), ahkTransport });
+  const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: defaultAhkConfig, ahkTransport });
   const ahkControls = wireAhkControls({ ahkConnector, logger });
 
   const pushTransport = new TampermonkeyPushTransport();
@@ -221,7 +221,6 @@ function readSetupForm() {
     vapidPublicKey: document.getElementById("field-vapid-public").value.trim(),
     vapidContact: document.getElementById("field-vapid-contact").value.trim(),
     rememberSecrets: document.getElementById("field-remember-secrets").checked,
-    ahk: defaultAhkConfig(),
     geofilterAnchor: { lat: 13.675873, lon: -89.281163 },
   };
   const secretConfig = {
