@@ -87,27 +87,17 @@ export class NotificationsService {
       return;
     }
 
-    // TEMPORARY TEST HOOK - remove after notification testing is done.
-    // Forces a match on this exact, deliberately-unlikely IV spread so
-    // end-to-end push testing doesn't have to wait hours for a real 100%
-    // IV spawn. Matches regardless of a subscription's own preferences.
-    const isTestTarget = normalize(spawn.species) === "pidgey" && spawn.ivSpread?.atk === 1 && spawn.ivSpread?.def === 10 && spawn.ivSpread?.sta === 4;
-
     const subscriptions = await this.#state.pushSubscriptions.all();
     let sent = 0;
     let failed = 0;
     for (const sub of subscriptions) {
-      const { isMatch, ivMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
-      if (!isMatch && !isTestTarget) continue;
+      const { isMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
+      if (!isMatch) continue;
       // Spanish, matching the rest of the app's user-facing text (see
-      // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.) - title is just
-      // the species so it reads cleanly in the notification's own bold
-      // header line; 💯 only for an actual 100%-IV match, not a
-      // species/type-only alert.
-      const headline = ivMatch ? `¡${spawn.species} 💯 detectado!` : `¡${spawn.species} detectado!`;
+      // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
       const outcome = await this.#send(sub, {
-        title: spawn.species,
-        body: `${headline} Hasta las ${formatDespawnTime(spawn.despawnAt)}`,
+        title: `${spawn.species} ${spawn.ivPercent ?? "?"}% IV`,
+        body: `Desaparece a las ${formatDespawnTime(spawn.despawnAt)}`,
         // Per-notification large icon (right-side image on Android) - the
         // species' own sprite instead of a static app icon. sw.js falls
         // back to the app icon if this is missing/fails to load.
