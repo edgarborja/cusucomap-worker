@@ -68,30 +68,56 @@ export class NotificationsService {
 
   async #notifySpawn(spawn) {
     const vapid = this.#getVapidConfig();
-    if (!vapid) return; // Web Push not configured - silently skip, dashboard already shows VAPID as not-ready
+    if (!vapid) {
+      // Was a silent no-op before - made noisy on purpose: VAPID is stored
+      // in SecretConfig, which is memory-only unless "remember secrets" is
+      // checked, so it can silently go blank on a reload that only
+      // re-entered the NSEC. Without this log there was no way to tell
+      // "nothing matched" apart from "nothing was ever configured to send."
+      this.#logger.warn("push", `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - VAPID not configured`);
+      return;
+    }
 
     // TEMPORARY TEST HOOK - remove after notification testing is done.
     // Forces a match on this exact, deliberately-unlikely IV spread so
     // end-to-end push testing doesn't have to wait hours for a real 100%
     // IV spawn. Matches regardless of a subscription's own preferences.
-    const isTestTarget = normalize(spawn.species) === "weedle" && spawn.ivSpread?.atk === 10 && spawn.ivSpread?.def === 5 && spawn.ivSpread?.sta === 15;
+    // IVs changed between test runs (previous target already spawned and
+    // is now in relay history) purely so each run's test spawn is
+    // unambiguous in the logs - not a technical requirement.
+    const isTestTarget = normalize(spawn.species) === "weedle" && spawn.ivSpread?.atk === 7 && spawn.ivSpread?.def === 0 && spawn.ivSpread?.sta === 5;
 
     const subscriptions = await this.#state.pushSubscriptions.all();
+    let sent = 0;
+    let failed = 0;
     for (const sub of subscriptions) {
       const { isMatch, matchedTypes } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
       if (!isMatch && !isTestTarget) continue;
       const typeSuffix = matchedTypes.length > 0 && !sub.preferences.species?.some((s) => normalize(s) === normalize(spawn.species))
         ? ` (${matchedTypes.map((t) => t[0].toUpperCase() + t.slice(1)).join("/")} alert)`
         : "";
-      await this.#send(sub, {
+      const outcome = await this.#send(sub, {
         title: `${spawn.species} spawned!`,
         body: `${spawn.ivPercent ?? "?"}% IV near ${spawn.cityRaw ?? "unknown location"}${typeSuffix}`,
         entityType: "spawn",
         entityId: spawn.id,
       });
+      if (outcome === "sent") sent++;
+      else if (outcome === "failed") failed++;
+    }
+
+    // One line per spawn that actually matched something, not one per
+    // notification sent - a busy spawn with many matching devices would
+    // otherwise flood the activity log.
+    if (sent + failed > 0) {
+      this.#logger.info(
+        "push",
+        `spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) matched ${sent + failed}/${subscriptions.length} subscriptions - sent ${sent}${failed > 0 ? `, ${failed} failed` : ""}`
+      );
     }
   }
 
+  /** @returns {Promise<"sent"|"removed"|"failed">} */
   async #send(subscription, payload) {
     const vapid = this.#getVapidConfig();
     try {
@@ -99,7 +125,9 @@ export class NotificationsService {
       const result = await this.#pushTransport.send(request);
       if (result.ok) {
         await this.#state.workerMetadata.increment("pushesSent");
-      } else if (result.status === 404 || result.status === 410) {
+        return "sent";
+      }
+      if (result.status === 404 || result.status === 410) {
         // Permanently invalid endpoint (browser uninstalled/subscription
         // expired, or the browser rotated it without the device managing to
         // publish an updated KIND_DEVICE_NOTIFY_CONFIG yet) - per the
@@ -110,13 +138,15 @@ export class NotificationsService {
         // directly) eventually gets cleaned up, per that section's addendum.
         await this.#state.pushSubscriptions.delete(subscription.nostrPubkey);
         this.#logger.info("push", `removed invalid subscription (HTTP ${result.status}): ${subscription.endpoint.slice(0, 60)}…`);
-      } else {
-        await this.#state.workerMetadata.increment("pushErrors");
-        this.#logger.warn("push", `send failed (${result.status ?? result.error}): ${subscription.endpoint.slice(0, 60)}…`);
+        return "removed";
       }
+      await this.#state.workerMetadata.increment("pushErrors");
+      this.#logger.warn("push", `send failed (${result.status ?? result.error}): ${subscription.endpoint.slice(0, 60)}…`);
+      return "failed";
     } catch (err) {
       await this.#state.workerMetadata.increment("pushErrors");
       this.#logger.error("push", `send threw: ${err.message}`);
+      return "failed";
     }
   }
 
