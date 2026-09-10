@@ -78,27 +78,24 @@ export class NotificationsService {
       return;
     }
 
-    // TEMPORARY TEST HOOK - remove after notification testing is done.
-    // Forces a match on this exact, deliberately-unlikely IV spread so
-    // end-to-end push testing doesn't have to wait hours for a real 100%
-    // IV spawn. Matches regardless of a subscription's own preferences.
-    // IVs changed between test runs (previous target already spawned and
-    // is now in relay history) purely so each run's test spawn is
-    // unambiguous in the logs - not a technical requirement.
-    const isTestTarget = normalize(spawn.species) === "weedle" && spawn.ivSpread?.atk === 7 && spawn.ivSpread?.def === 0 && spawn.ivSpread?.sta === 5;
-
     const subscriptions = await this.#state.pushSubscriptions.all();
     let sent = 0;
     let failed = 0;
     for (const sub of subscriptions) {
-      const { isMatch, matchedTypes } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
-      if (!isMatch && !isTestTarget) continue;
-      const typeSuffix = matchedTypes.length > 0 && !sub.preferences.species?.some((s) => normalize(s) === normalize(spawn.species))
-        ? ` (${matchedTypes.map((t) => t[0].toUpperCase() + t.slice(1)).join("/")} alert)`
-        : "";
+      const { isMatch, ivMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
+      if (!isMatch) continue;
+      // Spanish, matching the rest of the app's user-facing text (see
+      // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.) - title is just
+      // the species so it reads cleanly in the notification's own bold
+      // header line; 💯 only for an actual 100%-IV match, not a
+      // species/type-only alert.
       const outcome = await this.#send(sub, {
-        title: `${spawn.species} spawned!`,
-        body: `${spawn.ivPercent ?? "?"}% IV near ${spawn.cityRaw ?? "unknown location"}${typeSuffix}`,
+        title: spawn.species,
+        body: ivMatch ? `¡${spawn.species} 💯 detectado!` : `¡${spawn.species} detectado!`,
+        // Per-notification large icon (right-side image on Android) - the
+        // species' own sprite instead of a static app icon. sw.js falls
+        // back to the app icon if this is missing/fails to load.
+        icon: spawn.spriteUrl ?? null,
         entityType: "spawn",
         entityId: spawn.id,
       });
