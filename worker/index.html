@@ -78,10 +78,13 @@
       <span id="setup-status" hidden></span>
     </form>
     <p id="setup-error" class="error" hidden></p>
-    <!-- 2026-09-10 04:48 UTC is a plain string substitution deploy.sh does on the
-         copy it pushes - stays literal here in the source repo, since there's
-         no build step to inject a real timestamp before that point. -->
-    <p id="build-date">Build: 2026-09-10 04:48 UTC</p>
+    <!-- The placeholder below is a plain string substitution deploy.sh does
+         on the copy it pushes - stays literal here in the source repo,
+         since there's no build step to inject a real timestamp before that
+         point. Deliberately not spelled out verbatim in this comment - it
+         would otherwise get substituted too, since deploy.sh's sed isn't
+         scoped to just the one line that's meant to change. -->
+    <p id="build-date">Build: 2026-09-10 04:49 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
