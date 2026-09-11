@@ -29,6 +29,14 @@ export const BRIDGE_EVENTS = {
   // storage, so a Source Feed tab opened before the worker ever sent this still
   // picks up the last-known list instead of starting with none).
   SET_TRACKED_CHANNEL_IDS: "cusuco-worker-bridge:v1:set-tracked-channel-ids",
+  // Page -> bridge: the sidebar dnd-name of the channel to watch for an
+  // unread badge (see watch-channel-connector.js). Same push-on-start /
+  // GM-storage-backed shape as SET_TRACKED_CHANNEL_IDS above.
+  SET_WATCH_CHANNEL_NAME: "cusuco-worker-bridge:v1:set-watch-channel-name",
+  // Bridge -> page: the watched channel's unread badge just went from clear
+  // to set. Edge-triggered bridge-side (see the companion script's
+  // watchChannelAlreadyTriggered) - one event per new badge, not one per poll.
+  WATCH_CHANNEL_ALERT: "cusuco-worker-bridge:v1:watch-channel-alert",
   // Page -> bridge: POST this text to the operator's local AHK HTTP
   // listener (see AhkTransport / the companion script's AHK PROTOCOL comment).
   AHK_SEND_COMMAND: "cusuco-worker-bridge:v1:ahk-send-command",

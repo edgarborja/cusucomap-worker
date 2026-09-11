@@ -42,6 +42,10 @@
           <textarea id="field-source-feed-channels" rows="3" placeholder="123456789012345678"></textarea>
         </label>
 
+        <label>Watch channel name <span class="hint">(sidebar dnd-name of the channel whose unread badge should trigger an immediate priority scan + clear - leave blank to disable)</span>
+          <input id="field-watch-channel-name" type="text" />
+        </label>
+
         <label>Google OAuth client id <span class="hint">(not secret - this is the audience, not a credential)</span>
           <input id="field-google-client-id" type="text" placeholder="xxxxxxxx.apps.googleusercontent.com" />
         </label>
@@ -84,7 +88,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-10 06:11 UTC</p>
+    <p id="build-date">Build: 2026-09-11 02:18 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>

@@ -13,6 +13,7 @@ import { TampermonkeyPushTransport } from "./transports/push-transport.js";
 import { AhkTransport } from "./transports/ahk-transport.js";
 import { SourceFeedConnector } from "./connectors/source-feed-connector.js";
 import { AhkConnector } from "./connectors/ahk-connector.js";
+import { WatchChannelConnector } from "./connectors/watch-channel-connector.js";
 import { PokemonStateService } from "./services/pokemon-state.js";
 import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
@@ -146,6 +147,20 @@ async function startWorker(publicConfig, secretConfig) {
   const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: defaultAhkConfig, ahkTransport });
   const ahkControls = wireAhkControls({ ahkConnector, logger });
 
+  const watchChannelConnector = new WatchChannelConnector({
+    bus,
+    logger,
+    getWatchChannelName: () => publicConfig.watchChannelName,
+    getPriorityScanConfig: () => {
+      const config = defaultAhkConfig();
+      return { messages: config.priorityScanMessages, pause: { minS: config.priorityScanPauseMinS, maxS: config.priorityScanPauseMaxS } };
+    },
+    getClearUnreadHotkey: () => defaultAhkConfig().clearUnreadHotkey,
+    ahkConnector,
+    isAhkEnabled: ahkControls.isEnabled,
+  });
+  watchChannelConnector.start();
+
   const pushTransport = new TampermonkeyPushTransport();
   const notifications = new NotificationsService({
     state,
@@ -214,6 +229,7 @@ async function startWorker(publicConfig, secretConfig) {
 function populateSetupForm(publicConfig, secretConfig) {
   document.getElementById("field-relays").value = publicConfig.relays.join("\n");
   document.getElementById("field-source-feed-channels").value = publicConfig.trackedChannelIds.join("\n");
+  document.getElementById("field-watch-channel-name").value = publicConfig.watchChannelName;
   document.getElementById("field-google-client-id").value = publicConfig.googleClientId;
   document.getElementById("field-vapid-public").value = publicConfig.vapidPublicKey;
   document.getElementById("field-vapid-contact").value = publicConfig.vapidContact;
@@ -226,6 +242,7 @@ function readSetupForm() {
   const publicConfig = {
     relays: parseLines(document.getElementById("field-relays").value),
     trackedChannelIds: parseLines(document.getElementById("field-source-feed-channels").value),
+    watchChannelName: document.getElementById("field-watch-channel-name").value.trim(),
     googleClientId: document.getElementById("field-google-client-id").value.trim(),
     vapidPublicKey: document.getElementById("field-vapid-public").value.trim(),
     vapidContact: document.getElementById("field-vapid-contact").value.trim(),

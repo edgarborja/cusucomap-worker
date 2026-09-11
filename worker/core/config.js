@@ -25,6 +25,7 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
  * @property {string} vapidContact - "mailto:you@example.com", required by the Web Push VAPID spec.
  * @property {boolean} rememberSecrets
  * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
+ * @property {string} watchChannelName - sidebar dnd-name of the channel whose unread badge signals a hundo may have posted elsewhere (see worker/connectors/watch-channel-connector.js); pushed to the bridge the same way trackedChannelIds is.
  */
 
 /** @returns {PublicConfig} */
@@ -36,6 +37,7 @@ export function defaultPublicConfig() {
     vapidPublicKey: "",
     vapidContact: "mailto:example@example.com",
     rememberSecrets: false,
+    watchChannelName: "",
     // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
     // tracked channel's own /geofilter setting at the time this default was
     // captured.
@@ -76,6 +78,18 @@ export function defaultAhkConfig() {
       { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel" },
       { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel" },
     ],
+    // Sent immediately (not on the usual schedule) when the watch channel's
+    // unread badge fires, before the scheduledSearches rotation above
+    // resumes on its own - just the one hundo search, not the full 11-item
+    // rotation, so the clear-unread hotkey below doesn't sit behind several
+    // unrelated searches before it can fire.
+    priorityScanMessages: ["/pokesearch iv100"],
+    priorityScanPauseMinS: 3,
+    priorityScanPauseMaxS: 6,
+    // AHK key notation (see worker-bridge/http_send.ahk's Send call) for whatever combo
+    // marks every channel read - sent as one queued item via the "#HOTKEY# "
+    // sentinel, after the priority scan above finishes.
+    clearUnreadHotkey: "+{Escape}",
   };
 }
 

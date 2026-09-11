@@ -15,6 +15,13 @@ function normalize(text) {
   return String(text).trim().toLowerCase();
 }
 
+// A 100% IV alert that arrives with almost no time left on the clock isn't
+// actionable - the device's owner can't reasonably get there before it
+// despawns. Gates the whole notification pass per spawn (not per
+// subscription/preference), since despawn timing is a property of the
+// spawn itself.
+const MIN_REMAINING_MS_TO_NOTIFY = 5 * 60_000;
+
 /** "2:34pm" - lowercase, no leading zero on the hour, no space before am/pm. */
 function formatDespawnTime(despawnAtIso) {
   const d = new Date(despawnAtIso);
@@ -84,6 +91,15 @@ export class NotificationsService {
       // re-entered the NSEC. Without this log there was no way to tell
       // "nothing matched" apart from "nothing was ever configured to send."
       this.#logger.warn("push", `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - VAPID not configured`);
+      return;
+    }
+
+    const remainingMs = new Date(spawn.despawnAt).getTime() - Date.now();
+    if (remainingMs <= MIN_REMAINING_MS_TO_NOTIFY) {
+      this.#logger.info(
+        "push",
+        `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - only ${Math.max(0, Math.round(remainingMs / 60_000))} min left before despawn`
+      );
       return;
     }
 
