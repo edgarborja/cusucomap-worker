@@ -74,9 +74,14 @@ export function defaultAhkConfig() {
     searchPauseMaxS: 15,
     batchRestMinMin: 2,
     batchRestMaxMin: 3,
+    // doubleEnter: true - unlike a plain "/pokesearch ..." reply, these are
+    // real Discord slash commands: the first Enter only accepts the
+    // autocomplete/subcommand selection, it doesn't submit, so a plain
+    // "{Enter}" hotkey gets queued right after the command itself (see
+    // ahk-connector.js's #checkDailyCommands).
     dailyCommands: [
-      { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel" },
-      { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel" },
+      { label: "questset addchannel", targetHour: 23, jitterMinutes: 15, message: "/questset addchannel", doubleEnter: true },
+      { label: "raidset addchannel", targetHour: 4, jitterMinutes: 15, message: "/raidset addchannel", doubleEnter: true },
     ],
     // Sent immediately (not on the usual schedule) when the watch channel's
     // unread badge fires, before the scheduledSearches rotation above

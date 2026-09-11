@@ -193,7 +193,23 @@ export class AhkConnector {
         // Same pause as a scheduled search, not zero - see #sendChain's
         // comment for the incident this fixes (a daily command and the next
         // scheduled search racing into the same compose box).
-        await this.#sendSerialized(cmd.message, { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS });
+        const pause = { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS };
+        if (cmd.doubleEnter) {
+          // A real Discord slash command like "/questset addchannel" needs
+          // Enter pressed twice - the first only accepts the autocomplete/
+          // subcommand selection, it doesn't submit. Reuses the existing
+          // hotkey path rather than teaching AHK a new command type: queue
+          // the command, then queue a plain "{Enter}" hotkey right after it.
+          // Both #sendSerialized calls MUST be issued here with no `await`
+          // between them, same reasoning as watch-channel-connector.js's
+          // #handleAlert - otherwise a scheduled search could grab the chain
+          // slot between the command and its second Enter.
+          const commandSend = this.#sendSerialized(cmd.message, pause);
+          const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
+          await Promise.all([commandSend, enterSend]);
+        } else {
+          await this.#sendSerialized(cmd.message, pause);
+        }
         await this.#state.workerMetadata.set(sentKey, true);
         this.#logger.info("ahk", `sent daily command "${cmd.label}"`);
       }
