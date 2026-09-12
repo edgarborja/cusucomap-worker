@@ -35,6 +35,11 @@
       <label>Nostr relays (one per line)
         <textarea id="field-relays" rows="3" placeholder="wss://relay.snort.social"></textarea>
       </label>
+      <label class="checkbox">
+        <input id="field-remember" type="checkbox" />
+        Remember NSEC and relays in this browser's local storage (only do this on a machine you trust to stay
+        dedicated to this - anyone with access to this browser profile could read it back out).
+      </label>
       <button type="submit">Connect</button>
       <span id="connect-status" hidden></span>
     </form>

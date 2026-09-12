@@ -19,6 +19,29 @@ function parseLines(text) {
     .filter(Boolean);
 }
 
+// Only ever written if the operator explicitly ticks "remember" below -
+// same opt-in-only pattern as worker/core/config.js's SecretConfig (an
+// NSEC is exactly as sensitive here as it is there). Reads are wrapped in
+// try/catch (private-browsing/storage-disabled shouldn't break the page);
+// writes aren't, matching that file's own convention.
+const REMEMBER_KEY = "cusucomap-commands:remembered:v1";
+
+function loadRemembered() {
+  try {
+    const raw = localStorage.getItem(REMEMBER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+const remembered = loadRemembered();
+if (remembered) {
+  document.getElementById("field-nsec").value = remembered.nsec ?? "";
+  document.getElementById("field-relays").value = remembered.relaysText ?? "";
+  document.getElementById("field-remember").checked = true;
+}
+
 function button(label, onClick) {
   const b = document.createElement("button");
   b.type = "button";
@@ -134,6 +157,12 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     pool = new NT.SimplePool({ enablePing: true, enableReconnect: true });
 
     const commands = await callSelf("getAhkCommands");
+
+    if (document.getElementById("field-remember").checked) {
+      localStorage.setItem(REMEMBER_KEY, JSON.stringify({ nsec, relaysText: document.getElementById("field-relays").value }));
+    } else {
+      localStorage.removeItem(REMEMBER_KEY);
+    }
 
     document.getElementById("worker-npub").textContent = NT.nip19.npubEncode(pubkeyHex);
     document.getElementById("worker-npub").hidden = false;
