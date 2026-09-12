@@ -12,6 +12,19 @@
 // mid-type.
 const HOTKEY_PREFIX = "#HOTKEY# ";
 
+// Where scheduledSearches/dailyCommands are persisted once set via the
+// setAhkCommands RPC method (see worker-app.js and commands/commands-app.js)
+// - workerMetadata is IndexedDB-backed and already used for this connector's
+// own daily-command dedup bookkeeping below, so it's the natural place for
+// this too rather than a separate storage mechanism.
+const COMMANDS_METADATA_KEY = "ahkCommandsConfig";
+
+// Every daily command gets the same fixed jitter window, not a per-command
+// value - matches both of today's real entries (which both used 15) and
+// keeps the commands page simple (a timepicker, not a jitter-amount field
+// too - see the plan discussion this came out of).
+const DAILY_COMMAND_JITTER_MINUTES = 15;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -25,6 +38,30 @@ function randomInt(min, max) {
 function todayKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// The dedup/jitter bookkeeping below needs a stable-ish key per daily
+// command; rather than store a separate label field (one more thing to
+// edit on the commands page), it's just derived from the message text
+// itself - editing a command's text resets its "already sent today"/jitter
+// state for that slot, which is an acceptable edge case for something this
+// low-stakes.
+function deriveDailyCommandLabel(message) {
+  return message.trim().replace(/^\//, "");
+}
+
+/** @returns {string | null} a human-readable problem, or null if valid. */
+function validateCommandsPayload({ scheduledSearches, dailyCommands }) {
+  if (!Array.isArray(scheduledSearches) || scheduledSearches.length === 0 || scheduledSearches.some((m) => typeof m !== "string" || m.trim() === "")) {
+    return "scheduledSearches must be a non-empty array of non-empty strings.";
+  }
+  if (!Array.isArray(dailyCommands)) return "dailyCommands must be an array.";
+  for (const cmd of dailyCommands) {
+    if (!cmd || typeof cmd.message !== "string" || cmd.message.trim() === "") return "each daily command needs a non-empty message.";
+    if (!Number.isInteger(cmd.hour) || cmd.hour < 0 || cmd.hour > 23) return "each daily command's hour must be an integer 0-23.";
+    if (!Number.isInteger(cmd.minute) || cmd.minute < 0 || cmd.minute > 59) return "each daily command's minute must be an integer 0-59.";
+  }
+  return null;
 }
 
 export class AhkConnector {
@@ -56,6 +93,17 @@ export class AhkConnector {
   // one-at-a-time queue (see http_send.ahk's PumpQueue), which only
   // guarantees ordering, not that Discord's UI had time to settle in between.
   #sendChain = Promise.resolve();
+  // Lazily loaded from workerMetadata (falling back to getConfig()'s
+  // hardcoded defaults if nothing's ever been persisted) - see
+  // #loadCommandsIfNeeded. Cached here once loaded so repeated calls (every
+  // #runScheduledBatch/#checkDailyCommands cycle) don't re-hit IndexedDB.
+  #activeCommands = null;
+  // Bumped by #restartScheduledBatch whenever scheduledSearches actually
+  // changes - #runScheduledBatch checks this each iteration (same shape as
+  // the #running check) so an in-flight batch running the *old* list stops
+  // queuing further old items the moment a newer one starts, without
+  // disturbing whatever AHK send is already physically in flight.
+  #scheduledSearchesGeneration = 0;
 
   /**
    * @param {typeof import("../core/config.js").defaultAhkConfig} getConfig - lazy accessor (not a captured value), so a code change to defaultAhkConfig() takes effect on the next cycle without a restart - see that function's own comment for why this isn't part of PublicConfig.
@@ -79,6 +127,61 @@ export class AhkConnector {
     this.#running = false;
     clearTimeout(this.#batchTimer);
     clearInterval(this.#dailyCheckTimer);
+  }
+
+  async #loadCommandsIfNeeded() {
+    if (this.#activeCommands) return this.#activeCommands;
+    const persisted = await this.#state.workerMetadata.get(COMMANDS_METADATA_KEY, null);
+    if (persisted && Array.isArray(persisted.scheduledSearches) && Array.isArray(persisted.dailyCommands)) {
+      this.#activeCommands = { scheduledSearches: persisted.scheduledSearches, dailyCommands: persisted.dailyCommands };
+    } else {
+      const config = this.#getConfig();
+      this.#activeCommands = { scheduledSearches: config.scheduledSearches, dailyCommands: config.dailyCommands };
+    }
+    return this.#activeCommands;
+  }
+
+  /** For the getAhkCommands RPC handler (see worker-app.js). */
+  async getCommands() {
+    return this.#loadCommandsIfNeeded();
+  }
+
+  /**
+   * Applies a new scheduledSearches/dailyCommands pair - called from the
+   * setAhkCommands RPC handler. Restarts the scheduled batch loop
+   * immediately, but only if scheduledSearches actually differs from what's
+   * currently active; a dailyCommands-only change is just persisted and
+   * picked up by #checkDailyCommands' own next 60s tick, no restart needed.
+   * Returns a plain {ok, ...} result rather than throwing - rpc.js's
+   * #dispatch collapses any thrown error into a generic "Internal error"
+   * message, which would hide a validation error's actual reason from the
+   * caller.
+   */
+  async applyCommands({ scheduledSearches, dailyCommands }) {
+    const error = validateCommandsPayload({ scheduledSearches, dailyCommands });
+    if (error) return { ok: false, error };
+
+    const current = await this.#loadCommandsIfNeeded();
+    const searchesChanged = JSON.stringify(scheduledSearches) !== JSON.stringify(current.scheduledSearches);
+    const dailyChanged = JSON.stringify(dailyCommands) !== JSON.stringify(current.dailyCommands);
+
+    this.#activeCommands = { scheduledSearches, dailyCommands };
+    await this.#state.workerMetadata.set(COMMANDS_METADATA_KEY, this.#activeCommands);
+
+    if (searchesChanged) {
+      this.#logger.info("ahk", `scheduled searches updated (${scheduledSearches.length} commands) - restarting the loop now`);
+      this.#restartScheduledBatch();
+    }
+    if (dailyChanged) this.#logger.info("ahk", `daily commands updated (${dailyCommands.length} commands) - takes effect on the next check`);
+    if (!searchesChanged && !dailyChanged) this.#logger.info("ahk", "commands saved - no actual change from what was already active");
+
+    return { ok: true, scheduledSearches, dailyCommands };
+  }
+
+  #restartScheduledBatch() {
+    this.#scheduledSearchesGeneration++;
+    clearTimeout(this.#batchTimer);
+    if (this.#running) this.#runScheduledBatch();
   }
 
   // Every AHK send funnels through here (scheduled searches, daily
@@ -159,31 +262,35 @@ export class AhkConnector {
   }
 
   async #runScheduledBatch() {
+    const generation = this.#scheduledSearchesGeneration;
     const config = this.#getConfig();
-    for (const message of config.scheduledSearches) {
-      if (!this.#running) return;
+    const { scheduledSearches } = await this.#loadCommandsIfNeeded();
+    for (const message of scheduledSearches) {
+      if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
       await this.#sendSerialized(message, { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS });
     }
-    if (!this.#running) return;
+    if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
     const restMs = randomInt(config.batchRestMinMin, config.batchRestMaxMin) * 60_000;
     this.#batchTimer = setTimeout(() => this.#runScheduledBatch(), restMs);
   }
 
   async #checkDailyCommands() {
     const config = this.#getConfig();
+    const { dailyCommands } = await this.#loadCommandsIfNeeded();
     const today = todayKey();
     const now = Date.now();
-    for (const cmd of config.dailyCommands) {
+    for (const cmd of dailyCommands) {
       if (!this.#running) return;
-      const sentKey = `ahkDailyCommandSent:${cmd.label}:${today}`;
+      const label = deriveDailyCommandLabel(cmd.message);
+      const sentKey = `ahkDailyCommandSent:${label}:${today}`;
       if (await this.#state.workerMetadata.get(sentKey, false)) continue;
 
-      const instantKey = `ahkDailyCommandInstant:${cmd.label}:${today}`;
+      const instantKey = `ahkDailyCommandInstant:${label}:${today}`;
       let targetMs = await this.#state.workerMetadata.get(instantKey, null);
       if (targetMs === null) {
         const target = new Date();
-        target.setHours(cmd.targetHour, 0, 0, 0);
-        target.setMinutes(target.getMinutes() + randomInt(-cmd.jitterMinutes, cmd.jitterMinutes));
+        target.setHours(cmd.hour, cmd.minute, 0, 0);
+        target.setMinutes(target.getMinutes() + randomInt(-DAILY_COMMAND_JITTER_MINUTES, DAILY_COMMAND_JITTER_MINUTES));
         targetMs = target.getTime();
         await this.#state.workerMetadata.set(instantKey, targetMs);
       }
@@ -194,24 +301,20 @@ export class AhkConnector {
         // comment for the incident this fixes (a daily command and the next
         // scheduled search racing into the same compose box).
         const pause = { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS };
-        if (cmd.doubleEnter) {
-          // A real Discord slash command like "/questset addchannel" needs
-          // Enter pressed twice - the first only accepts the autocomplete/
-          // subcommand selection, it doesn't submit. Reuses the existing
-          // hotkey path rather than teaching AHK a new command type: queue
-          // the command, then queue a plain "{Enter}" hotkey right after it.
-          // Both #sendSerialized calls MUST be issued here with no `await`
-          // between them, same reasoning as watch-channel-connector.js's
-          // #handleAlert - otherwise a scheduled search could grab the chain
-          // slot between the command and its second Enter.
-          const commandSend = this.#sendSerialized(cmd.message, pause);
-          const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
-          await Promise.all([commandSend, enterSend]);
-        } else {
-          await this.#sendSerialized(cmd.message, pause);
-        }
+        // Every daily command is a real Discord slash command, which needs
+        // Enter pressed twice - the first only accepts the autocomplete/
+        // subcommand selection, it doesn't submit. Reuses the existing
+        // hotkey path rather than teaching AHK a new command type: queue
+        // the command, then queue a plain "{Enter}" hotkey right after it.
+        // Both #sendSerialized calls MUST be issued here with no `await`
+        // between them, same reasoning as watch-channel-connector.js's
+        // #handleAlert - otherwise a scheduled search could grab the chain
+        // slot between the command and its second Enter.
+        const commandSend = this.#sendSerialized(cmd.message, pause);
+        const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
+        await Promise.all([commandSend, enterSend]);
         await this.#state.workerMetadata.set(sentKey, true);
-        this.#logger.info("ahk", `sent daily command "${cmd.label}"`);
+        this.#logger.info("ahk", `sent daily command "${label}"`);
       }
     }
   }

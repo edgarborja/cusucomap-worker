@@ -1,0 +1,44 @@
+@charset "UTF-8";
+/* Layered on top of ../worker/style.css (shared tokens/panels/forms) - just
+   the row layout this page needs that nothing else in the app does. */
+
+.command-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.command-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.command-row .command-text {
+  flex: 1;
+  margin-top: 0;
+}
+
+.command-row .command-time {
+  width: 110px;
+  margin-top: 0;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+}
+
+.command-row button {
+  flex: none;
+  padding: 6px 10px;
+}
+
+#save-status {
+  margin-left: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}

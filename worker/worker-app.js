@@ -184,6 +184,21 @@ async function startWorker(publicConfig, secretConfig) {
     raids: await state.raids.active(),
     fieldResearch: await state.fieldResearch.active(),
   }));
+  // Both self-pubkey-only (see commands/commands-app.js and
+  // tools/set-ahk-commands.mjs, which sign as the worker's own identity):
+  // this is admin control over what gets typed into the operator's own
+  // Discord session, not something to expose to an arbitrary caller who
+  // merely knows the worker's public npub. Returning {ok:false, ...} here
+  // rather than throwing is deliberate - rpc.js's #dispatch collapses any
+  // thrown error into a generic "Internal error" message.
+  rpc.handle("getAhkCommands", async (_params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    return { ok: true, ...(await ahkConnector.getCommands()) };
+  });
+  rpc.handle("setAhkCommands", async (params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    return ahkConnector.applyCommands(params ?? {});
+  });
   rpc.start();
 
   wireNostrPublishing(bus, transport, logger);
