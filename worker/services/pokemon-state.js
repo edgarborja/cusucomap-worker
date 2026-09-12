@@ -29,6 +29,36 @@ export class PokemonStateService {
     }, SWEEP_INTERVAL_MS);
   }
 
+  /**
+   * Force-expires every currently active field research (quest) entity -
+   * exposed via the dashboard's "Expire all field research" button, for the
+   * operator to clear out the previous day's quests before scanning fresh
+   * ones. Not a local-only status flip: sweepExpired() alone wouldn't make
+   * anything disappear for viewers, since visibility is governed by the
+   * *published* event's own content.status and expiration tag (see
+   * PROTOCOL.md), not by anything the worker decides afterward - this
+   * republishes each quest instead, which is what wireNostrPublishing's
+   * fieldResearch.updated listener (worker-app.js) actually reacts to.
+   *
+   * expiresAt is set a short buffer into the future, not to "now" exactly -
+   * PROTOCOL.md's expiration tag follows NIP-40, and a relay may reject a
+   * publish whose expiration has *already* passed by the time it's
+   * received (see #ingest's own comment on the same risk). status is set
+   * to "expired" immediately regardless, which is what actually makes a
+   * viewer stop showing it right away rather than waiting out that buffer.
+   * @returns {number} how many were expired
+   */
+  async expireAllFieldResearchNow() {
+    const EXPIRY_BUFFER_MS = 30_000;
+    const active = await this.#state.fieldResearch.active();
+    const expiresAt = new Date(Date.now() + EXPIRY_BUFFER_MS).toISOString();
+    for (const quest of active) {
+      await this.#state.fieldResearch.upsert({ ...quest, status: "expired", expiresAt });
+    }
+    if (active.length > 0) this.#logger.info("pokemon-state", `force-expired ${active.length} field research entities`);
+    return active.length;
+  }
+
   async #ingest(label, entity, validate, store, expiryField) {
     const errors = validate(entity);
     if (errors.length > 0) {

@@ -88,7 +88,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-12 05:16 UTC</p>
+    <p id="build-date">Build: 2026-09-12 17:27 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -105,6 +105,15 @@
     <div class="panel">
       <h2>Activity log</h2>
       <ul id="activity-log"></ul>
+    </div>
+
+    <div class="panel">
+      <h2>Field research</h2>
+      <p class="hint">Force-expires every currently active quest, so a fresh scan for the new day doesn't sit alongside yesterday's leftovers.</p>
+      <p>
+        <button id="expire-field-research" type="button">Expire all field research</button>
+        <span id="expire-field-research-status" hidden></span>
+      </p>
     </div>
 
     <div class="panel">

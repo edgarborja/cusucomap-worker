@@ -238,6 +238,24 @@ async function startWorker(publicConfig, secretConfig) {
     await ahkConnector.sendCustomCommand(value);
   });
 
+  document.getElementById("expire-field-research").addEventListener("click", async () => {
+    const activeCount = (await state.fieldResearch.active()).length;
+    if (activeCount === 0) {
+      logger.info("pokemon-state", "no active field research to expire.");
+      return;
+    }
+    if (!confirm(`Expire all ${activeCount} active field research quests now? This can't be undone.`)) return;
+
+    const statusEl = document.getElementById("expire-field-research-status");
+    statusEl.textContent = "Expiring…";
+    statusEl.hidden = false;
+    const expiredCount = await pokemonState.expireAllFieldResearchNow();
+    statusEl.textContent = `Expired ${expiredCount}.`;
+    setTimeout(() => {
+      statusEl.hidden = true;
+    }, 3000);
+  });
+
   logger.info("worker", `started as ${transport.identity.npub}`);
 }
 
