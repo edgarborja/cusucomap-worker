@@ -1,7 +1,9 @@
 // Decides who gets a push notification and sends it, and owns the
 // device-side registration/preferences state behind that decision.
-// Preference matching: IV alert OR species alert OR any alerted type, one
-// notification even if several match - evaluated against IndexedDB
+// Preference matching: IV alert OR species alert OR any alerted type OR any
+// alerted badge (zeroIv/maxLevel/highCp/xxl/dulceXl - mirrors the viewer's
+// own spawn detail badges), one notification even if several match -
+// evaluated against IndexedDB
 // subscriptions, sent via services/push-sender.js (Web Push) or
 // services/fcm-sender.js (FCM), both through the same PushTransport
 // bridge, instead of the `web-push`/`firebase-admin` npm packages.
@@ -44,21 +46,46 @@ function formatDespawnTime(despawnAtIso) {
   return `${hour}:${minutes}${period}`;
 }
 
+// Mirrors cusucomap-viewer's src/cusuco-sidebar.ts's NOTE_BADGE_DEFS_ES
+// exactly - these are the same five badges the viewer's own spawn detail
+// pane already computes from a spawn's own fields, just evaluated
+// worker-side against `preferences.badges` instead of always-on. Keyed by
+// the same recognized-value strings a device sends in that array; an
+// unrecognized string in `preferences.badges` (typo, future viewer-side
+// addition not yet mirrored here) is simply never matched, not an error -
+// matching this file's existing tolerance for species/types.
+const BADGE_MATCHERS = {
+  zeroIv: (spawn) => spawn.ivPercent === 0,
+  maxLevel: (spawn) => spawn.level === 35,
+  highCp: (spawn) => spawn.cp !== null && spawn.cp >= 2500,
+  xxl: (spawn) => spawn.sizeTag === "XXL",
+  dulceXl: (spawn) => spawn.level !== null && spawn.level >= 31 && spawn.level <= 34,
+};
+
 /**
- * True if `preferences` should fire for a spawn with this species/types/IV.
- * `preferences.ivPerfect` defaults to true (unset, not `false`) - V1
- * behavior is "every enabled device gets notified on a 100% IV spawn"
- * regardless of species/type configuration (see shared/notifications.md
- * section 3); an explicit `false` is how a device opts out of just that
- * category once more preference categories exist. Exported for unit
- * testing.
+ * True if `preferences` should fire for `spawn`. `preferences.ivPerfect`
+ * defaults to true (unset, not `false`) - V1 behavior is "every enabled
+ * device gets notified on a 100% IV spawn" regardless of species/type/badge
+ * configuration (see shared/notifications.md section 3); an explicit
+ * `false` is how a device opts out of just that category. `species`/
+ * `types`/`badges` are independent categories, ORed together - any one
+ * match is enough. Exported for unit testing.
+ * @param {object} preferences
+ * @param {{species: string, types: string[], ivPercent: number|null, level: number|null, cp: number|null, sizeTag: string|null}} spawn
  */
-export function matchesSpawnAlert(preferences, species, types, ivPercent) {
+export function matchesSpawnAlert(preferences, spawn) {
   const speciesSet = new Set((preferences.species ?? []).map(normalize));
   const typeSet = new Set((preferences.types ?? []).map(normalize));
-  const matchedTypes = (types ?? []).filter((t) => typeSet.has(normalize(t)));
-  const ivMatch = preferences.ivPerfect !== false && ivPercent === 100;
-  return { isMatch: ivMatch || speciesSet.has(normalize(species)) || matchedTypes.length > 0, matchedTypes, ivMatch };
+  const matchedTypes = (spawn.types ?? []).filter((t) => typeSet.has(normalize(t)));
+  const ivMatch = preferences.ivPerfect !== false && spawn.ivPercent === 100;
+  const badgeSet = new Set(preferences.badges ?? []);
+  const matchedBadges = Object.keys(BADGE_MATCHERS).filter((badge) => badgeSet.has(badge) && BADGE_MATCHERS[badge](spawn));
+  return {
+    isMatch: ivMatch || speciesSet.has(normalize(spawn.species)) || matchedTypes.length > 0 || matchedBadges.length > 0,
+    matchedTypes,
+    matchedBadges,
+    ivMatch,
+  };
 }
 
 export class NotificationsService {
@@ -126,7 +153,7 @@ export class NotificationsService {
     let sent = 0;
     let failed = 0;
     for (const sub of subscriptions) {
-      const { isMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn.species, spawn.types ?? [], spawn.ivPercent);
+      const { isMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn);
       if (!isMatch) continue;
       // Spanish, matching the rest of the app's user-facing text (see
       // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
@@ -283,6 +310,7 @@ export class NotificationsService {
         ivPerfect: data.preferences?.ivPerfect !== false,
         species: data.preferences?.species ?? [],
         types: data.preferences?.types ?? [],
+        badges: data.preferences?.badges ?? [],
       },
       updatedAt: Date.now(),
       sourceCreatedAt: createdAt,
