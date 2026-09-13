@@ -132,7 +132,7 @@ export class NotificationsService {
       // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
       const outcome = await this.#send(sub, vapid, fcmConfig, {
         title: `${spawn.species} ${spawn.ivPercent ?? "?"}% IV`,
-        body: `Desaparece a las ${formatDespawnTime(spawn.despawnAt)}`,
+        body: `${spawn.cp ?? "?"} CP, Hasta las ${formatDespawnTime(spawn.despawnAt)}`,
         // Per-notification large icon (right-side image on Android) - the
         // species' own sprite instead of a static app icon. sw.js falls
         // back to the app icon if this is missing/fails to load.
