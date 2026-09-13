@@ -18,6 +18,7 @@ import { PokemonStateService } from "./services/pokemon-state.js";
 import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
+import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
 
 const WORKER_STATUS_INTERVAL_MS = 60_000;
@@ -58,50 +59,155 @@ const AHK_ENABLE_GRACE_MS = 5_000;
  * there's time to alt-tab into the Source Feed window - the AHK script still
  * needs it focused to simulate keystrokes correctly, same as the old
  * clipboard-paste path did. Clicking again during the countdown cancels it.
- * @returns {{ isEnabled: () => boolean }}
+ * @returns {{ isEnabled: () => boolean, enableThenRun: (syncCallback: () => unknown) => Promise<unknown> }}
  */
 function wireAhkControls({ ahkConnector, logger }) {
   const toggleButton = document.getElementById("ahk-toggle");
   const statusEl = document.getElementById("ahk-status");
   let enabled = false;
   let countdownTimer = null;
+  let cancelCurrentEnable = null;
 
   function setDisabled() {
     clearTimeout(countdownTimer);
     countdownTimer = null;
+    cancelCurrentEnable?.();
+    cancelCurrentEnable = null;
     if (enabled) ahkConnector.stop();
     enabled = false;
     toggleButton.textContent = "Enable AHK";
     statusEl.textContent = "Disabled";
   }
 
-  function setEnabling() {
-    const startedAt = Date.now();
-    toggleButton.textContent = "Cancel";
-    const tick = () => {
-      const remainingS = Math.max(0, Math.ceil((AHK_ENABLE_GRACE_MS - (Date.now() - startedAt)) / 1000));
-      if (remainingS <= 0) {
-        countdownTimer = null;
-        enabled = true;
-        ahkConnector.start();
-        toggleButton.textContent = "Disable AHK";
-        statusEl.textContent = "Enabled";
-        logger.info("ahk", "AHK enabled - sending scheduled/daily/manual commands.");
-        return;
-      }
-      statusEl.textContent = `Starting in ${remainingS}s - switch to the Source Feed window now`;
-      countdownTimer = setTimeout(tick, 250);
-    };
-    tick();
+  /**
+   * Enables AHK if it isn't already (running the same grace-period
+   * countdown as before), then calls `syncCallback` and resolves/rejects
+   * with its result - used directly by the toggle button (with a no-op
+   * callback) and by the bulk-scan buttons (see wireBulkScanSection),
+   * which need their scan to claim priority the instant AHK starts rather
+   * than race the scheduled batch for it. That guarantee is *why*
+   * `syncCallback` is invoked synchronously, in the same tick as
+   * ahkConnector.start(), rather than via a caller separately awaiting a
+   * resolved promise and calling it after - going through even one extra
+   * `await` before calling it would leave a window for #runScheduledBatch's
+   * own already-suspended continuation to run first (see
+   * AhkConnector#runBulkScan's own "no await gap" reasoning for the same
+   * class of bug, fixed the same way here).
+   * @param {() => unknown} syncCallback
+   */
+  function enableThenRun(syncCallback) {
+    if (enabled) return Promise.resolve(syncCallback());
+    if (countdownTimer) return Promise.reject(new Error("Already enabling AHK - wait for that to finish first."));
+
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      toggleButton.textContent = "Cancel";
+      let cancelled = false;
+      cancelCurrentEnable = () => {
+        cancelled = true;
+      };
+      const tick = () => {
+        if (cancelled) {
+          reject(new Error("Enabling AHK was cancelled."));
+          return;
+        }
+        const remainingS = Math.max(0, Math.ceil((AHK_ENABLE_GRACE_MS - (Date.now() - startedAt)) / 1000));
+        if (remainingS <= 0) {
+          countdownTimer = null;
+          cancelCurrentEnable = null;
+          enabled = true;
+          ahkConnector.start();
+          toggleButton.textContent = "Disable AHK";
+          statusEl.textContent = "Enabled";
+          logger.info("ahk", "AHK enabled - sending scheduled/daily/manual commands.");
+          resolve(syncCallback());
+          return;
+        }
+        statusEl.textContent = `Starting in ${remainingS}s - switch to the Source Feed window now`;
+        countdownTimer = setTimeout(tick, 250);
+      };
+      tick();
+    });
   }
 
   toggleButton.addEventListener("click", () => {
     if (enabled || countdownTimer) setDisabled();
-    else setEnabling();
+    else enableThenRun(() => {}).catch(() => {}); // errors are already reflected in statusEl above
   });
 
   setDisabled();
-  return { isEnabled: () => enabled };
+  return { isEnabled: () => enabled, enableThenRun };
+}
+
+// Not a secret - just pasted scan-group coordinates - so this persists
+// unconditionally, unlike the commands page's opt-in-only NSEC storage.
+const SCAN_CSV_STORAGE_PREFIX = "cusucomap-worker:scan-csv:";
+
+/**
+ * Wires one bulk-scan <details> section (see index.html's quest-scan/
+ * raid-scan id groups) - shared between both sections since they're
+ * identical apart from which command-builder they use.
+ * @param {string} id - "quest-scan" or "raid-scan".
+ * @param {(location: object) => string[]} buildRowCommands
+ */
+function wireBulkScanSection(id, buildRowCommands, { ahkConnector, ahkControls, logger }) {
+  const textarea = document.getElementById(`${id}-csv`);
+  const startButton = document.getElementById(`${id}-start`);
+  const cancelButton = document.getElementById(`${id}-cancel`);
+  const statusEl = document.getElementById(`${id}-status`);
+  const storageKey = `${SCAN_CSV_STORAGE_PREFIX}${id}`;
+
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved !== null) textarea.value = saved;
+  } catch {
+    // Private browsing/storage disabled - just means it won't remember.
+  }
+  textarea.addEventListener("input", () => {
+    try {
+      localStorage.setItem(storageKey, textarea.value);
+    } catch {
+      // ignore
+    }
+  });
+
+  startButton.addEventListener("click", async () => {
+    const { groups, errors } = parseScanGroupsCsv(textarea.value);
+    for (const err of errors) logger.warn("ahk", `${id}: ${err}`);
+    if (groups.length === 0) {
+      logger.warn("ahk", `${id}: nothing to scan - paste the group list first.`);
+      return;
+    }
+    const enableNotice = ahkControls.isEnabled() ? "" : " AHK is currently disabled, so this will enable it first (same 5s grace period as the toggle button).";
+    if (!confirm(`Start a scan over ${groups.length} groups? This takes priority over the scheduled loop and hundo detection until it finishes.${enableNotice}`)) return;
+
+    startButton.hidden = true;
+    cancelButton.hidden = false;
+    statusEl.hidden = false;
+    statusEl.textContent = "Starting…";
+
+    try {
+      // enableThenRun (not just checking isEnabled()) is what makes this
+      // scan take actual priority when AHK was off: it enables AHK and
+      // starts the scan in the same tick, so the scan claims the send
+      // queue before the freshly-started scheduled batch gets a chance to
+      // queue anything - see that function's own comment for why.
+      const result = await ahkControls.enableThenRun(() =>
+        ahkConnector.runBulkScan(groups, buildRowCommands, (sent, total) => {
+          statusEl.textContent = `Sending ${sent}/${total}…`;
+        })
+      );
+      statusEl.textContent = result.cancelled ? `Cancelled after ${result.sent}/${result.total}.` : `Done - sent ${result.sent} commands.`;
+    } catch (err) {
+      logger.error("ahk", `${id} failed: ${err.message}`);
+      statusEl.textContent = `Failed: ${err.message}`;
+    } finally {
+      startButton.hidden = false;
+      cancelButton.hidden = true;
+    }
+  });
+
+  cancelButton.addEventListener("click", () => ahkConnector.cancelBulkScan());
 }
 
 /** Re-broadcasts everything currently active on startup - a relay that pruned an entity while the worker was offline (or a newly-added relay with no history at all) still converges to the correct current state. */
@@ -160,6 +266,9 @@ async function startWorker(publicConfig, secretConfig) {
     isAhkEnabled: ahkControls.isEnabled,
   });
   watchChannelConnector.start();
+
+  wireBulkScanSection("quest-scan", buildQuestGroupCommands, { ahkConnector, ahkControls, logger });
+  wireBulkScanSection("raid-scan", buildRaidGroupCommands, { ahkConnector, ahkControls, logger });
 
   const pushTransport = new TampermonkeyPushTransport();
   const notifications = new NotificationsService({

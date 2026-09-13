@@ -88,7 +88,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-12 17:27 UTC</p>
+    <p id="build-date">Build: 2026-09-13 02:11 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -127,6 +127,35 @@
         <input id="ahk-command-input" type="text" placeholder="/pokesearch iv100" />
         <button type="submit">Send</button>
       </form>
+    </div>
+
+    <div class="panel">
+      <h2>Bulk scans</h2>
+      <p class="hint">
+        Runs a full pass of geofilter + search commands over a pasted list of scan-group centers (columns:
+        Latitude, Longitude, Distance in meters, GroupMemberCount - order doesn't matter). Takes priority over the
+        scheduled loop and hundo detection until it finishes or is cancelled.
+      </p>
+
+      <details id="quest-scan-details">
+        <summary>Quest scan</summary>
+        <textarea id="quest-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
+        <p>
+          <button id="quest-scan-start" type="button">Start quest scan</button>
+          <button id="quest-scan-cancel" type="button" hidden>Cancel</button>
+          <span id="quest-scan-status" hidden></span>
+        </p>
+      </details>
+
+      <details id="raid-scan-details">
+        <summary>Raid scan</summary>
+        <textarea id="raid-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
+        <p>
+          <button id="raid-scan-start" type="button">Start raid scan</button>
+          <button id="raid-scan-cancel" type="button" hidden>Cancel</button>
+          <span id="raid-scan-status" hidden></span>
+        </p>
+      </details>
     </div>
   </section>
 </main>

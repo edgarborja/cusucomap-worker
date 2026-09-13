@@ -204,3 +204,24 @@ table td:first-child {
 #ahk-form input {
   flex: 1;
 }
+
+details {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 10px 0;
+}
+
+details + details {
+  margin-top: 10px;
+}
+
+details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+details textarea {
+  margin-top: 10px;
+}

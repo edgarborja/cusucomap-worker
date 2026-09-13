@@ -61,6 +61,12 @@ export class WatchChannelConnector {
 
     this.#busy = true;
     try {
+      // A bulk scan (see worker/core/scan-groups.js, AhkConnector#runBulkScan)
+      // takes priority over this - wait it out rather than interleave with
+      // it. Deliberately before the no-await-gap pair below, not between
+      // its two calls.
+      await this.#ahkConnector.waitForBulkScanClear();
+
       const { messages, pause } = this.#getPriorityScanConfig();
       this.#logger.info("watch-channel", `unread badge detected - clearing it, then sending priority scan (${messages.length} searches)`);
 

@@ -104,6 +104,26 @@ export class AhkConnector {
   // queuing further old items the moment a newer one starts, without
   // disturbing whatever AHK send is already physically in flight.
   #scheduledSearchesGeneration = 0;
+  // Bulk-scan precedence gate (see runBulkScan) - resolved when no scan is
+  // running, pending for the scan's entire duration. #runScheduledBatch,
+  // #checkDailyCommands, and watch-channel-connector.js's #handleAlert all
+  // await this before sending anything, which is what actually gives a
+  // bulk scan priority over them: not by racing for the next #sendChain
+  // slot (the same race that corrupted compose boxes earlier in this
+  // file's history), but by nobody else even attempting to enqueue while
+  // it's pending. The scan's own sends don't wait on it - only everyone
+  // else does.
+  #bulkScanGate = Promise.resolve();
+  #bulkScanActive = false;
+  #bulkScanCancelRequested = false;
+  // #checkDailyCommands can now block for as long as a bulk scan takes
+  // (potentially much longer than its own 60s tick interval) - without
+  // this, a second/third tick could stack up waiting on the same gate and
+  // all fire the same daily command once it clears. #runScheduledBatch
+  // doesn't need the equivalent: it's only ever re-entered via its own
+  // recursive setTimeout or #restartScheduledBatch, never an unconditional
+  // timer, so there's no way for two of its invocations to overlap.
+  #dailyCheckRunning = false;
 
   /**
    * @param {typeof import("../core/config.js").defaultAhkConfig} getConfig - lazy accessor (not a captured value), so a code change to defaultAhkConfig() takes effect on the next cycle without a restart - see that function's own comment for why this isn't part of PublicConfig.
@@ -267,6 +287,8 @@ export class AhkConnector {
     const { scheduledSearches } = await this.#loadCommandsIfNeeded();
     for (const message of scheduledSearches) {
       if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
+      await this.#bulkScanGate;
+      if (!this.#running || generation !== this.#scheduledSearchesGeneration) return; // re-check - a scan may have run for a while
       await this.#sendSerialized(message, { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS });
     }
     if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
@@ -275,47 +297,117 @@ export class AhkConnector {
   }
 
   async #checkDailyCommands() {
-    const config = this.#getConfig();
-    const { dailyCommands } = await this.#loadCommandsIfNeeded();
-    const today = todayKey();
-    const now = Date.now();
-    for (const cmd of dailyCommands) {
-      if (!this.#running) return;
-      const label = deriveDailyCommandLabel(cmd.message);
-      const sentKey = `ahkDailyCommandSent:${label}:${today}`;
-      if (await this.#state.workerMetadata.get(sentKey, false)) continue;
-
-      const instantKey = `ahkDailyCommandInstant:${label}:${today}`;
-      let targetMs = await this.#state.workerMetadata.get(instantKey, null);
-      if (targetMs === null) {
-        const target = new Date();
-        target.setHours(cmd.hour, cmd.minute, 0, 0);
-        target.setMinutes(target.getMinutes() + randomInt(-DAILY_COMMAND_JITTER_MINUTES, DAILY_COMMAND_JITTER_MINUTES));
-        targetMs = target.getTime();
-        await this.#state.workerMetadata.set(instantKey, targetMs);
-      }
-
-      if (now >= targetMs) {
+    if (this.#dailyCheckRunning) return;
+    this.#dailyCheckRunning = true;
+    try {
+      const config = this.#getConfig();
+      const { dailyCommands } = await this.#loadCommandsIfNeeded();
+      const today = todayKey();
+      const now = Date.now();
+      for (const cmd of dailyCommands) {
         if (!this.#running) return;
-        // Same pause as a scheduled search, not zero - see #sendChain's
-        // comment for the incident this fixes (a daily command and the next
-        // scheduled search racing into the same compose box).
-        const pause = { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS };
-        // Every daily command is a real Discord slash command, which needs
-        // Enter pressed twice - the first only accepts the autocomplete/
-        // subcommand selection, it doesn't submit. Reuses the existing
-        // hotkey path rather than teaching AHK a new command type: queue
-        // the command, then queue a plain "{Enter}" hotkey right after it.
-        // Both #sendSerialized calls MUST be issued here with no `await`
-        // between them, same reasoning as watch-channel-connector.js's
-        // #handleAlert - otherwise a scheduled search could grab the chain
-        // slot between the command and its second Enter.
-        const commandSend = this.#sendSerialized(cmd.message, pause);
-        const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
-        await Promise.all([commandSend, enterSend]);
-        await this.#state.workerMetadata.set(sentKey, true);
-        this.#logger.info("ahk", `sent daily command "${label}"`);
+        const label = deriveDailyCommandLabel(cmd.message);
+        const sentKey = `ahkDailyCommandSent:${label}:${today}`;
+        if (await this.#state.workerMetadata.get(sentKey, false)) continue;
+
+        const instantKey = `ahkDailyCommandInstant:${label}:${today}`;
+        let targetMs = await this.#state.workerMetadata.get(instantKey, null);
+        if (targetMs === null) {
+          const target = new Date();
+          target.setHours(cmd.hour, cmd.minute, 0, 0);
+          target.setMinutes(target.getMinutes() + randomInt(-DAILY_COMMAND_JITTER_MINUTES, DAILY_COMMAND_JITTER_MINUTES));
+          targetMs = target.getTime();
+          await this.#state.workerMetadata.set(instantKey, targetMs);
+        }
+
+        if (now >= targetMs) {
+          if (!this.#running) return;
+          await this.#bulkScanGate;
+          if (!this.#running) return; // re-check - a scan may have run for a while
+          // Same pause as a scheduled search, not zero - see #sendChain's
+          // comment for the incident this fixes (a daily command and the next
+          // scheduled search racing into the same compose box).
+          const pause = { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS };
+          // Every daily command is a real Discord slash command, which needs
+          // Enter pressed twice - the first only accepts the autocomplete/
+          // subcommand selection, it doesn't submit. Reuses the existing
+          // hotkey path rather than teaching AHK a new command type: queue
+          // the command, then queue a plain "{Enter}" hotkey right after it.
+          // Both #sendSerialized calls MUST be issued here with no `await`
+          // between them, same reasoning as watch-channel-connector.js's
+          // #handleAlert - otherwise a scheduled search could grab the chain
+          // slot between the command and its second Enter.
+          const commandSend = this.#sendSerialized(cmd.message, pause);
+          const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
+          await Promise.all([commandSend, enterSend]);
+          await this.#state.workerMetadata.set(sentKey, true);
+          this.#logger.info("ahk", `sent daily command "${label}"`);
+        }
       }
+    } finally {
+      this.#dailyCheckRunning = false;
     }
+  }
+
+  /** For watch-channel-connector.js's #handleAlert - see #bulkScanGate. */
+  async waitForBulkScanClear() {
+    await this.#bulkScanGate;
+  }
+
+  isBulkScanActive() {
+    return this.#bulkScanActive;
+  }
+
+  /** No-op if no scan is currently running. Checked between commands, not mid-send - see runBulkScan. */
+  cancelBulkScan() {
+    if (this.#bulkScanActive) this.#bulkScanCancelRequested = true;
+  }
+
+  /**
+   * Runs a bulk scan: for each location in `locations`, sends
+   * `buildRowCommands(location)` in sequence with the normal search pause -
+   * used for the dashboard's quest-scan/raid-scan sections (see
+   * worker/core/scan-groups.js and worker-app.js). Takes exclusive priority
+   * over the scheduled batch, daily commands, and the watch-channel
+   * priority scan for its entire duration (see #bulkScanGate); only one
+   * bulk scan, of either kind, can run at a time.
+   * @param {object[]} locations
+   * @param {(location: object) => string[]} buildRowCommands
+   * @param {(sent: number, total: number) => void} [onProgress]
+   * @returns {Promise<{sent: number, total: number, cancelled: boolean}>}
+   */
+  async runBulkScan(locations, buildRowCommands, onProgress) {
+    if (this.#bulkScanActive) throw new Error("A scan is already running.");
+    this.#bulkScanActive = true;
+    this.#bulkScanCancelRequested = false;
+    let releaseGate;
+    this.#bulkScanGate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+
+    const { searchPauseMinS, searchPauseMaxS } = this.#getConfig();
+    const pause = { minS: searchPauseMinS, maxS: searchPauseMaxS };
+    const total = locations.reduce((sum, location) => sum + buildRowCommands(location).length, 0);
+    let sent = 0;
+    let cancelled = false;
+    try {
+      scanLoop: for (const location of locations) {
+        for (const message of buildRowCommands(location)) {
+          if (!this.#running || this.#bulkScanCancelRequested) {
+            cancelled = true;
+            break scanLoop;
+          }
+          await this.#sendSerialized(message, pause);
+          sent++;
+          onProgress?.(sent, total);
+        }
+      }
+    } finally {
+      this.#bulkScanActive = false;
+      this.#bulkScanCancelRequested = false;
+      releaseGate();
+      this.#bulkScanGate = Promise.resolve();
+    }
+    return { sent, total, cancelled };
   }
 }
