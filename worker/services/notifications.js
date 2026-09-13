@@ -1,14 +1,27 @@
-// Decides who gets a Web Push notification and sends it, and owns the
+// Decides who gets a push notification and sends it, and owns the
 // device-side registration/preferences state behind that decision.
 // Preference matching: IV alert OR species alert OR any alerted type, one
 // notification even if several match - evaluated against IndexedDB
-// subscriptions, sent via services/push-sender.js + a PushTransport
-// instead of the `web-push` npm package. Registration state arrives as
-// KIND_DEVICE_NOTIFY_CONFIG (addressable, NIP-44 encrypted, published by
-// the device) rather than an RPC call - see shared/notifications.md
-// section 1 for why the ephemeral RPC kinds can't satisfy "recover state
-// after reconnecting."
+// subscriptions, sent via services/push-sender.js (Web Push) or
+// services/fcm-sender.js (FCM), both through the same PushTransport
+// bridge, instead of the `web-push`/`firebase-admin` npm packages.
+// Registration state arrives as KIND_DEVICE_NOTIFY_CONFIG (addressable,
+// NIP-44 encrypted, published by the device) rather than an RPC call - see
+// shared/notifications.md section 1 for why the ephemeral RPC kinds can't
+// satisfy "recover state after reconnecting."
+//
+// Two independent delivery channels, one per stored row's `type`: a
+// browser/PWA device registers `webpush` (unchanged since this was Web
+// Push-only); the Android wrapper app (Capacitor WebView, which can't use
+// the Push API at all) registers `fcm` instead. Both are additive and
+// fully independent - see shared/notifications.md's FCM section for why
+// they're never merged into one "target" per user: each device already
+// gets its own row keyed by its own Nostr pubkey, so a phone with the
+// native app and a desktop browser for the same person are already two
+// separate rows before FCM ever entered the picture. A missing/failed
+// channel never blocks the other from sending.
 import { createWebPushRequest } from "./push-sender.js";
+import { sendFcmMessage } from "./fcm-sender.js";
 import { KIND_DEVICE_NOTIFY_CONFIG } from "../../shared/nostr-protocol.js";
 
 function normalize(text) {
@@ -54,24 +67,29 @@ export class NotificationsService {
   #transport;
   #pushTransport;
   #getVapidConfig;
+  #getFcmConfig;
   #logger;
 
   /**
    * @param {object} deps
    * @param {import("../transports/nostr-transport.js").NostrTransport} deps.transport
    *   Used to subscribe for KIND_DEVICE_NOTIFY_CONFIG - the Nostr side, not
-   *   pushTransport (which only sends the already-built Web Push HTTP
-   *   request).
+   *   pushTransport (which only sends the already-built HTTP request, Web
+   *   Push or FCM).
    * @param {() => { vapidPublicKey: string, vapidPrivateKey: string, contact: string } | null} deps.getVapidConfig
    *   Lazy accessor (not a captured value) so a config change/Start Worker
    *   after construction is picked up without re-wiring this service.
+   * @param {() => { project_id: string, client_email: string, private_key: string } | null} deps.getFcmConfig
+   *   Same lazy-accessor shape as getVapidConfig, for the parsed Firebase
+   *   service-account JSON (see core/config.js's SecretConfig).
    */
-  constructor({ state, bus, transport, pushTransport, getVapidConfig, logger }) {
+  constructor({ state, bus, transport, pushTransport, getVapidConfig, getFcmConfig, logger }) {
     this.#state = state;
     this.#bus = bus;
     this.#transport = transport;
     this.#pushTransport = pushTransport;
     this.#getVapidConfig = getVapidConfig;
+    this.#getFcmConfig = getFcmConfig;
     this.#logger = logger;
   }
 
@@ -84,13 +102,14 @@ export class NotificationsService {
 
   async #notifySpawn(spawn) {
     const vapid = this.#getVapidConfig();
-    if (!vapid) {
-      // Was a silent no-op before - made noisy on purpose: VAPID is stored
+    const fcmConfig = this.#getFcmConfig();
+    if (!vapid && !fcmConfig) {
+      // Was a silent no-op before - made noisy on purpose: both are stored
       // in SecretConfig, which is memory-only unless "remember secrets" is
-      // checked, so it can silently go blank on a reload that only
+      // checked, so either can silently go blank on a reload that only
       // re-entered the NSEC. Without this log there was no way to tell
       // "nothing matched" apart from "nothing was ever configured to send."
-      this.#logger.warn("push", `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - VAPID not configured`);
+      this.#logger.warn("push", `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - neither Web Push (VAPID) nor FCM configured`);
       return;
     }
 
@@ -111,7 +130,7 @@ export class NotificationsService {
       if (!isMatch) continue;
       // Spanish, matching the rest of the app's user-facing text (see
       // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
-      const outcome = await this.#send(sub, {
+      const outcome = await this.#send(sub, vapid, fcmConfig, {
         title: `${spawn.species} ${spawn.ivPercent ?? "?"}% IV`,
         body: `Desaparece a las ${formatDespawnTime(spawn.despawnAt)}`,
         // Per-notification large icon (right-side image on Android) - the
@@ -141,9 +160,25 @@ export class NotificationsService {
     }
   }
 
-  /** @returns {Promise<"sent"|"removed"|"failed">} */
-  async #send(subscription, payload) {
-    const vapid = this.#getVapidConfig();
+  /**
+   * Dispatches by the stored row's channel - each channel's own send path
+   * is fully independent (own try/catch, own cleanup-on-invalid), so a
+   * failure or misconfiguration on one can never block or roll back the
+   * other. `type` defaults to "webpush" (see #handleDeviceConfig) so an
+   * old row from before this field existed is never misrouted.
+   * @returns {Promise<"sent"|"removed"|"failed"|"skipped">}
+   */
+  async #send(subscription, vapid, fcmConfig, payload) {
+    if (subscription.type === "fcm") return this.#sendFcm(subscription, fcmConfig, payload);
+    return this.#sendWebPush(subscription, vapid, payload);
+  }
+
+  /** Untouched from before FCM existed, apart from the log-message prefixes - see push-sender.js. */
+  async #sendWebPush(subscription, vapid, payload) {
+    if (!vapid) {
+      this.#logger.warn("push", `skipped Web Push to device ${subscription.nostrPubkey.slice(0, 8)}… - VAPID not configured`);
+      return "skipped";
+    }
     try {
       const request = await createWebPushRequest(subscription, payload, vapid);
       const result = await this.#pushTransport.send(request);
@@ -161,15 +196,42 @@ export class NotificationsService {
         // that vanished (site data cleared, no way to tell the worker
         // directly) eventually gets cleaned up, per that section's addendum.
         await this.#state.pushSubscriptions.delete(subscription.nostrPubkey);
-        this.#logger.info("push", `removed invalid subscription (HTTP ${result.status}): ${subscription.endpoint.slice(0, 60)}…`);
+        this.#logger.info("push", `removed invalid Web Push subscription (HTTP ${result.status}): ${subscription.endpoint.slice(0, 60)}…`);
         return "removed";
       }
       await this.#state.workerMetadata.increment("pushErrors");
-      this.#logger.warn("push", `send failed (${result.status ?? result.error}): ${subscription.endpoint.slice(0, 60)}…`);
+      this.#logger.warn("push", `Web Push send failed (${result.status ?? result.error}): ${subscription.endpoint.slice(0, 60)}…`);
       return "failed";
     } catch (err) {
       await this.#state.workerMetadata.increment("pushErrors");
-      this.#logger.error("push", `send threw: ${err.message}`);
+      this.#logger.error("push", `Web Push send threw: ${err.message}`);
+      return "failed";
+    }
+  }
+
+  /** Same shape/outcomes as #sendWebPush, via fcm-sender.js instead - see that file for why it needs the transport injected rather than building a request the caller sends. */
+  async #sendFcm(subscription, fcmConfig, payload) {
+    if (!fcmConfig) {
+      this.#logger.warn("push", `skipped FCM send to device ${subscription.nostrPubkey.slice(0, 8)}… - FCM service account not configured`);
+      return "skipped";
+    }
+    try {
+      const result = await sendFcmMessage(fcmConfig, subscription.token, payload, (request) => this.#pushTransport.send(request));
+      if (result.ok) {
+        await this.#state.workerMetadata.increment("pushesSent");
+        return "sent";
+      }
+      if (result.invalidToken) {
+        await this.#state.pushSubscriptions.delete(subscription.nostrPubkey);
+        this.#logger.info("push", `removed invalid FCM token (HTTP ${result.status}): ${subscription.token.slice(0, 20)}…`);
+        return "removed";
+      }
+      await this.#state.workerMetadata.increment("pushErrors");
+      this.#logger.warn("push", `FCM send failed (${result.status ?? result.error}): ${subscription.token.slice(0, 20)}…`);
+      return "failed";
+    } catch (err) {
+      await this.#state.workerMetadata.increment("pushErrors");
+      this.#logger.error("push", `FCM send threw: ${err.message}`);
       return "failed";
     }
   }
@@ -177,10 +239,17 @@ export class NotificationsService {
   /**
    * Handles one decrypted KIND_DEVICE_NOTIFY_CONFIG event - a device's full
    * current notification state (see shared/notifications.md section 1 for
-   * the wire shape). `fromPubkey` is the device's identity; its signature
-   * on this event (already verified before this method runs - see
+   * the wire shape, and its FCM section for the `type`/`token` addition).
+   * `fromPubkey` is the device's identity; its signature on this event
+   * (already verified before this method runs - see
    * NostrTransport#subscribeEncrypted) is the only authentication needed,
    * so a device can only ever update its own row.
+   *
+   * `type` discriminates the two storage shapes below: "webpush" (the
+   * original, unchanged shape - `endpoint`/`keys`) or "fcm" (`token`
+   * instead). Missing/anything-other-than-"fcm" defaults to "webpush" -
+   * every row published before this field existed, and any future typo,
+   * both fall back to the behavior this device already had.
    */
   async #handleDeviceConfig({ fromPubkey, createdAt, data }) {
     if (!data || typeof data !== "object") {
@@ -204,25 +273,35 @@ export class NotificationsService {
       return;
     }
 
-    const { subscription, preferences } = data;
+    const type = data.type === "fcm" ? "fcm" : "webpush";
+    const user = await this.#state.users.findByIdentity("nostr", fromPubkey);
+    const common = {
+      nostrPubkey: fromPubkey,
+      type,
+      userId: user?.userId ?? null,
+      preferences: {
+        ivPerfect: data.preferences?.ivPerfect !== false,
+        species: data.preferences?.species ?? [],
+        types: data.preferences?.types ?? [],
+      },
+      updatedAt: Date.now(),
+      sourceCreatedAt: createdAt,
+    };
+
+    if (type === "fcm") {
+      if (typeof data.token !== "string" || data.token.trim() === "") {
+        this.#logger.warn("push", `dropped fcm device config from ${fromPubkey.slice(0, 8)}… - invalid/missing token`);
+        return;
+      }
+      await this.#state.pushSubscriptions.put({ ...common, token: data.token });
+      return;
+    }
+
+    const { subscription } = data;
     if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
       this.#logger.warn("push", `dropped device config from ${fromPubkey.slice(0, 8)}… - invalid subscription shape`);
       return;
     }
-
-    const user = await this.#state.users.findByIdentity("nostr", fromPubkey);
-    await this.#state.pushSubscriptions.put({
-      nostrPubkey: fromPubkey,
-      endpoint: subscription.endpoint,
-      keys: subscription.keys,
-      userId: user?.userId ?? null,
-      preferences: {
-        ivPerfect: preferences?.ivPerfect !== false,
-        species: preferences?.species ?? [],
-        types: preferences?.types ?? [],
-      },
-      updatedAt: Date.now(),
-      sourceCreatedAt: createdAt,
-    });
+    await this.#state.pushSubscriptions.put({ ...common, endpoint: subscription.endpoint, keys: subscription.keys });
   }
 }

@@ -71,6 +71,10 @@
           <input id="field-vapid-private" type="password" autocomplete="off" />
         </label>
 
+        <label>Firebase (FCM) service account JSON <span class="hint">(for push to the Android app - paste the full key file contents; leave blank if not sending to Android)</span>
+          <textarea id="field-fcm-service-account" rows="4" placeholder='{"type": "service_account", ...}' autocomplete="off"></textarea>
+        </label>
+
         <label class="checkbox">
           <input id="field-remember-secrets" type="checkbox" />
           Remember secrets in this browser's local storage (only do this on a machine you trust to stay dedicated to
@@ -88,7 +92,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-13 02:11 UTC</p>
+    <p id="build-date">Build: 2026-09-13 21:51 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>

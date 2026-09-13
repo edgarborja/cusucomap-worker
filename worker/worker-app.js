@@ -6,7 +6,7 @@
 import { EventBus } from "./core/event-bus.js";
 import { Logger } from "./core/logging.js";
 import { createApplicationState } from "./core/application-state.js";
-import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig, clearPersistedSecrets, defaultAhkConfig } from "./core/config.js";
+import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig, clearPersistedSecrets, defaultAhkConfig, defaultSecretConfig } from "./core/config.js";
 import { NostrTransport } from "./transports/nostr-transport.js";
 import { Rpc } from "./transports/rpc.js";
 import { TampermonkeyPushTransport } from "./transports/push-transport.js";
@@ -270,6 +270,27 @@ async function startWorker(publicConfig, secretConfig) {
   wireBulkScanSection("quest-scan", buildQuestGroupCommands, { ahkConnector, ahkControls, logger });
   wireBulkScanSection("raid-scan", buildRaidGroupCommands, { ahkConnector, ahkControls, logger });
 
+  // secretConfig.fcmServiceAccountJson is fixed for this session (set once
+  // at Start Worker time, like vapidPrivateKey/nsec), so parsing it once
+  // here and caching the result - rather than re-parsing on every
+  // #notifySpawn call - is enough; also means a malformed paste only ever
+  // logs once instead of on every spawn.
+  let fcmConfigCache; // undefined = not parsed yet, null = unset/invalid
+  function getFcmConfig() {
+    if (fcmConfigCache !== undefined) return fcmConfigCache;
+    if (!secretConfig.fcmServiceAccountJson) {
+      fcmConfigCache = null;
+    } else {
+      try {
+        fcmConfigCache = JSON.parse(secretConfig.fcmServiceAccountJson);
+      } catch (err) {
+        logger.error("push", `FCM service account JSON is invalid, ignoring it: ${err.message}`);
+        fcmConfigCache = null;
+      }
+    }
+    return fcmConfigCache;
+  }
+
   const pushTransport = new TampermonkeyPushTransport();
   const notifications = new NotificationsService({
     state,
@@ -280,6 +301,7 @@ async function startWorker(publicConfig, secretConfig) {
       publicConfig.vapidPublicKey && secretConfig.vapidPrivateKey
         ? { vapidPublicKey: publicConfig.vapidPublicKey, vapidPrivateKey: secretConfig.vapidPrivateKey, contact: publicConfig.vapidContact }
         : null,
+    getFcmConfig,
     logger,
   });
   notifications.start();
@@ -378,6 +400,7 @@ function populateSetupForm(publicConfig, secretConfig) {
   document.getElementById("field-remember-secrets").checked = publicConfig.rememberSecrets;
   document.getElementById("field-nsec").value = secretConfig.nsec;
   document.getElementById("field-vapid-private").value = secretConfig.vapidPrivateKey;
+  document.getElementById("field-fcm-service-account").value = secretConfig.fcmServiceAccountJson;
 }
 
 function readSetupForm() {
@@ -394,13 +417,14 @@ function readSetupForm() {
   const secretConfig = {
     nsec: document.getElementById("field-nsec").value.trim(),
     vapidPrivateKey: document.getElementById("field-vapid-private").value.trim(),
+    fcmServiceAccountJson: document.getElementById("field-fcm-service-account").value.trim(),
   };
   return { publicConfig, secretConfig };
 }
 
 function main() {
   const publicConfig = loadPublicConfig();
-  const secretConfig = publicConfig.rememberSecrets ? loadSecretConfig() : { nsec: "", vapidPrivateKey: "" };
+  const secretConfig = publicConfig.rememberSecrets ? loadSecretConfig() : defaultSecretConfig();
   populateSetupForm(publicConfig, secretConfig);
 
   const errorEl = document.getElementById("setup-error");

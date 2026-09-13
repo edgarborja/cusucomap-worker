@@ -108,10 +108,11 @@ export function defaultAhkConfig() {
  * @typedef {object} SecretConfig
  * @property {string} nsec
  * @property {string} vapidPrivateKey
+ * @property {string} fcmServiceAccountJson - the full contents of a Firebase Admin SDK service-account JSON key file (as text, pasted as-is) - used to send push notifications to the Android wrapper app via FCM's HTTP v1 API. Same never-logged, memory-unless-remembered treatment as nsec/vapidPrivateKey (see worker/index.html's setup screen). Parsed lazily where needed (see worker-app.js's getFcmConfig) rather than here, so a paste error just fails that parse instead of this module.
  */
 
 export function defaultSecretConfig() {
-  return { nsec: "", vapidPrivateKey: "" };
+  return { nsec: "", vapidPrivateKey: "", fcmServiceAccountJson: "" };
 }
 
 export function loadPublicConfig() {

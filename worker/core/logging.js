@@ -8,9 +8,12 @@ const MAX_ENTRIES = 300;
 // scans stringified args for anything that looks like an nsec and masks it,
 // on top of every call site being expected not to pass raw secrets at all.
 const NSEC_RE = /nsec1[a-z0-9]{20,}/gi;
+// Same idea for a PEM private key block - the shape of the FCM service
+// account's `private_key` field (see core/config.js's SecretConfig).
+const PEM_PRIVATE_KEY_RE = /-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g;
 
 function sanitize(text) {
-  return text.replace(NSEC_RE, (m) => `${m.slice(0, 10)}…[redacted]`);
+  return text.replace(NSEC_RE, (m) => `${m.slice(0, 10)}…[redacted]`).replace(PEM_PRIVATE_KEY_RE, "[redacted private key]");
 }
 
 /** @typedef {{ at: number, level: "info"|"warn"|"error", scope: string, message: string }} LogEntry */
