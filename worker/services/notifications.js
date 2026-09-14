@@ -2,9 +2,14 @@
 // device-side registration/preferences state behind that decision.
 // Preference matching: IV alert OR species alert OR any alerted type OR any
 // alerted badge (zeroIv/maxLevel/highCp/xxl/dulceXl - mirrors the viewer's
-// own spawn detail badges), one notification even if several match -
-// evaluated against IndexedDB
-// subscriptions, sent via services/push-sender.js (Web Push) or
+// own spawn detail badges), one notification even if several match.
+// spawn.created events are debounced into short batches (see
+// BATCH_DEBOUNCE_MS) before matching runs, rather than notified one at a
+// time - in practice this groups "everything one AHK search command's
+// reply(ies) turned up" into a single combined notification per device
+// instead of one per spawn, without needing to track which command sent
+// what. Evaluated against IndexedDB subscriptions, sent via
+// services/push-sender.js (Web Push) or
 // services/fcm-sender.js (FCM), both through the same PushTransport
 // bridge, instead of the `web-push`/`firebase-admin` npm packages.
 // Registration state arrives as KIND_DEVICE_NOTIFY_CONFIG (addressable,
@@ -37,6 +42,26 @@ function normalize(text) {
 // spawn itself.
 const MIN_REMAINING_MS_TO_NOTIFY = 5 * 60_000;
 
+// Spawns from one AHK search command (however many Discord messages its
+// results spanned - a /pokesearch reply over 4 results continues into a
+// second, headerless message) arrive at the worker in a tight cluster;
+// spawns from a *different* command are always separated by at least the
+// shortest settle pause this connector ever uses (the watch-channel's
+// priority scan, 3s minimum - see ahk-connector.js's priorityScanPauseMinS)
+// plus scrape/network latency. Debouncing spawn.created on a window
+// shorter than that pacing floor is what groups "one command's results"
+// into one notification without needing to correlate against
+// ahk.command-sent directly (which races: that event also fires for the
+// clear-unread hotkey immediately after a priority scan, before its own
+// reply may have even been scraped yet). MAX_WAIT bounds a batch that
+// somehow never goes quiet (continuous activity) to a hard ceiling.
+const BATCH_DEBOUNCE_MS = 2_000;
+const BATCH_MAX_WAIT_MS = 6_000;
+// How many individual spawns to name in a combined notification's body
+// before summarizing the rest as "y N más" - a push notification's body
+// has a real (platform-dependent) length limit.
+const MAX_LISTED_IN_COMBINED_BODY = 3;
+
 /** "2:34pm" - lowercase, no leading zero on the hour, no space before am/pm. */
 function formatDespawnTime(despawnAtIso) {
   const d = new Date(despawnAtIso);
@@ -44,6 +69,62 @@ function formatDespawnTime(despawnAtIso) {
   const period = d.getHours() >= 12 ? "pm" : "am";
   const hour = d.getHours() % 12 || 12;
   return `${hour}:${minutes}${period}`;
+}
+
+/** Unchanged from before batching existed - the common case (one spawn matched). */
+function buildSingleSpawnPayload(spawn) {
+  // Spanish, matching the rest of the app's user-facing text (see
+  // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
+  return {
+    title: `${spawn.species} ${spawn.ivPercent ?? "?"}% IV`,
+    body: `${spawn.cp ?? "?"} CP, Hasta las ${formatDespawnTime(spawn.despawnAt)}`,
+    // Per-notification large icon (right-side image on Android) - the
+    // species' own sprite instead of a static app icon. sw.js falls back
+    // to the app icon if this is missing/fails to load.
+    icon: spawn.spriteUrl ?? null,
+    // Read by sw.js: tag dedupes a re-notification for the same spawn
+    // (replaces instead of stacking), url deep-links into the viewer -
+    // format confirmed against the viewer's actual query param.
+    tag: String(spawn.id),
+    url: `https://cusucomap.com/?spawn=${spawn.id}`,
+    entityType: "spawn",
+    entityId: spawn.id,
+  };
+}
+
+/**
+ * Multiple spawns from the same batch matched one device's preferences -
+ * one notification naming all of them, capped, rather than one per spawn.
+ * No `tag`: unlike a single spawn (which replaces its own prior
+ * notification if re-sent), there's no one spawn identity to key a
+ * replace-in-place on here, and a *different* batch's combined
+ * notification stacking on top of this one is the right behavior anyway.
+ * url/icon point at whichever match despawns soonest, for the same reason
+ * "pick one" beats inventing a multi-id deep link the viewer doesn't
+ * support yet.
+ */
+function buildCombinedSpawnPayload(spawns) {
+  const speciesList = [...new Set(spawns.map((s) => s.species))];
+  const title = speciesList.length === 1 ? `${spawns.length}x ${speciesList[0]}` : speciesList.length <= 3 ? speciesList.join(", ") : `${spawns.length} Pokémon`;
+
+  const listed = spawns.slice(0, MAX_LISTED_IN_COMBINED_BODY);
+  const overflow = spawns.length - listed.length;
+  const parts = listed.map((s) => `${s.species} (${s.cp ?? "?"} CP)`);
+  if (overflow > 0) parts.push(`y ${overflow} más`);
+
+  const soonest = spawns.reduce((min, s) => (new Date(s.despawnAt).getTime() < new Date(min.despawnAt).getTime() ? s : min));
+  return {
+    title,
+    body: `${parts.join(", ")} - Hasta las ${formatDespawnTime(soonest.despawnAt)}`,
+    icon: soonest.spriteUrl ?? null,
+    url: `https://cusucomap.com/?spawn=${soonest.id}`,
+    entityType: "spawn",
+    entityId: soonest.id,
+  };
+}
+
+function buildNotificationPayload(matches) {
+  return matches.length === 1 ? buildSingleSpawnPayload(matches[0]) : buildCombinedSpawnPayload(matches);
 }
 
 // Mirrors cusucomap-viewer's src/cusuco-sidebar.ts's NOTE_BADGE_DEFS_ES
@@ -96,6 +177,13 @@ export class NotificationsService {
   #getVapidConfig;
   #getFcmConfig;
   #logger;
+  // Batching state (see BATCH_DEBOUNCE_MS's comment for why this exists
+  // instead of notifying on every single spawn.created) - spawns collected
+  // since the last flush, and the two timers governing when the next flush
+  // happens.
+  #pendingSpawns = [];
+  #debounceTimer = null;
+  #maxWaitTimer = null;
 
   /**
    * @param {object} deps
@@ -121,13 +209,33 @@ export class NotificationsService {
   }
 
   start() {
-    this.#bus.on("spawn.created", ({ entity }) => this.#notifySpawn(entity));
+    this.#bus.on("spawn.created", ({ entity }) => this.#queueSpawn(entity));
     this.#transport.subscribeEncrypted(KIND_DEVICE_NOTIFY_CONFIG, (msg) =>
       this.#handleDeviceConfig(msg).catch((err) => this.#logger.error("push", `device config handling threw: ${err.message}`))
     );
   }
 
-  async #notifySpawn(spawn) {
+  /** Buffers `spawn` and (re)arms the debounce/max-wait timers - see BATCH_DEBOUNCE_MS's comment. */
+  #queueSpawn(spawn) {
+    this.#pendingSpawns.push(spawn);
+    clearTimeout(this.#debounceTimer);
+    this.#debounceTimer = setTimeout(() => this.#flushBatch(), BATCH_DEBOUNCE_MS);
+    // Only armed once per batch (cleared alongside #debounceTimer in
+    // #flushBatch) - this is a ceiling on the whole batch's lifetime, not
+    // something that should reset on every arriving spawn the way the
+    // debounce timer does.
+    if (!this.#maxWaitTimer) this.#maxWaitTimer = setTimeout(() => this.#flushBatch(), BATCH_MAX_WAIT_MS);
+  }
+
+  async #flushBatch() {
+    clearTimeout(this.#debounceTimer);
+    clearTimeout(this.#maxWaitTimer);
+    this.#debounceTimer = null;
+    this.#maxWaitTimer = null;
+    const spawns = this.#pendingSpawns;
+    this.#pendingSpawns = [];
+    if (spawns.length === 0) return;
+
     const vapid = this.#getVapidConfig();
     const fcmConfig = this.#getFcmConfig();
     if (!vapid && !fcmConfig) {
@@ -136,53 +244,36 @@ export class NotificationsService {
       // checked, so either can silently go blank on a reload that only
       // re-entered the NSEC. Without this log there was no way to tell
       // "nothing matched" apart from "nothing was ever configured to send."
-      this.#logger.warn("push", `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - neither Web Push (VAPID) nor FCM configured`);
+      this.#logger.warn("push", `skipped notification batch of ${spawns.length} spawn(s) - neither Web Push (VAPID) nor FCM configured`);
       return;
     }
 
-    const remainingMs = new Date(spawn.despawnAt).getTime() - Date.now();
-    if (remainingMs <= MIN_REMAINING_MS_TO_NOTIFY) {
-      this.#logger.info(
-        "push",
-        `skipped notification check for spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) - only ${Math.max(0, Math.round(remainingMs / 60_000))} min left before despawn`
-      );
-      return;
+    const now = Date.now();
+    const actionable = spawns.filter((spawn) => new Date(spawn.despawnAt).getTime() - now > MIN_REMAINING_MS_TO_NOTIFY);
+    if (actionable.length < spawns.length) {
+      this.#logger.info("push", `skipped ${spawns.length - actionable.length}/${spawns.length} spawn(s) in this batch - too little time left before despawn`);
     }
+    if (actionable.length === 0) return;
 
     const subscriptions = await this.#state.pushSubscriptions.all();
-    let sent = 0;
-    let failed = 0;
+    let devicesSent = 0;
+    let devicesFailed = 0;
     for (const sub of subscriptions) {
-      const { isMatch } = matchesSpawnAlert(sub.preferences ?? {}, spawn);
-      if (!isMatch) continue;
-      // Spanish, matching the rest of the app's user-facing text (see
-      // CLAUDE.md/cusucomap-viewer's TEAM_LABELS_ES etc.).
-      const outcome = await this.#send(sub, vapid, fcmConfig, {
-        title: `${spawn.species} ${spawn.ivPercent ?? "?"}% IV`,
-        body: `${spawn.cp ?? "?"} CP, Hasta las ${formatDespawnTime(spawn.despawnAt)}`,
-        // Per-notification large icon (right-side image on Android) - the
-        // species' own sprite instead of a static app icon. sw.js falls
-        // back to the app icon if this is missing/fails to load.
-        icon: spawn.spriteUrl ?? null,
-        // Read by sw.js: tag dedupes a re-notification for the same spawn
-        // (replaces instead of stacking), url deep-links into the viewer -
-        // format confirmed against the viewer's actual query param.
-        tag: String(spawn.id),
-        url: `https://cusucomap.com/?spawn=${spawn.id}`,
-        entityType: "spawn",
-        entityId: spawn.id,
-      });
-      if (outcome === "sent") sent++;
-      else if (outcome === "failed") failed++;
+      const matches = actionable.filter((spawn) => matchesSpawnAlert(sub.preferences ?? {}, spawn).isMatch);
+      if (matches.length === 0) continue;
+      const outcome = await this.#send(sub, vapid, fcmConfig, buildNotificationPayload(matches));
+      if (outcome === "sent") devicesSent++;
+      else if (outcome === "failed") devicesFailed++;
     }
 
-    // One line per spawn that actually matched something, not one per
-    // notification sent - a busy spawn with many matching devices would
+    // One line per batch that actually matched something, not one per
+    // notification sent - a busy batch with many matching devices would
     // otherwise flood the activity log.
-    if (sent + failed > 0) {
+    if (devicesSent + devicesFailed > 0) {
+      const species = [...new Set(actionable.map((s) => s.species))].join(", ");
       this.#logger.info(
         "push",
-        `spawn ${spawn.species} (${spawn.ivPercent ?? "?"}% IV) matched ${sent + failed}/${subscriptions.length} subscriptions - sent ${sent}${failed > 0 ? `, ${failed} failed` : ""}`
+        `batch of ${actionable.length} spawn(s) (${species}) matched ${devicesSent + devicesFailed}/${subscriptions.length} subscriptions - sent ${devicesSent}${devicesFailed > 0 ? `, ${devicesFailed} failed` : ""}`
       );
     }
   }
