@@ -141,6 +141,7 @@ const BADGE_MATCHERS = {
   highCp: (spawn) => spawn.cp !== null && spawn.cp >= 2500,
   xxl: (spawn) => spawn.sizeTag === "XXL",
   dulceXl: (spawn) => spawn.level !== null && spawn.level >= 31 && spawn.level <= 34,
+  pvp: (spawn) => spawn.ivSpread?.atk === 0 && spawn.ivSpread?.def === 15 && spawn.ivSpread?.sta === 15,
 };
 
 /**
