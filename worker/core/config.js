@@ -112,8 +112,12 @@ export function defaultAhkConfig() {
     // schedule resumes - and also once at worker startup on the very first
     // AHK enable, in case a previous run got interrupted mid-scan and left
     // the geofilter cleared. See worker-app.js's runAreaScan RPC handler
-    // and wireAhkControls' own startup hook.
-    defaultGeofilterCommand: "/pokeset geofilter radius:10km center:13.677440,-89.283353",
+    // and wireAhkControls' own startup hook. The tab between the two named
+    // params (not a plain space) is required - see scan-groups.js's
+    // PARAM_SEPARATOR for why: a plain space becomes part of the first
+    // param's own typed value rather than moving to the next field, but
+    // http_send.ahk's TypeIt already sends a real {Tab} keypress for `\t`.
+    defaultGeofilterCommand: "/pokeset geofilter radius:10km\tcenter:13.677440,-89.283353",
   };
 }
 
