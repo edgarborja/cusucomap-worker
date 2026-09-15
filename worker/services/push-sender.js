@@ -17,6 +17,24 @@
 // likely culprit is a push-service-specific quirk (e.g. TTL/Topic header
 // expectations) rather than the encryption math itself.
 
+/**
+ * Thrown when a stored subscription's own `keys.p256dh`/`keys.auth` can't be
+ * decoded as base64url - as opposed to a network/push-service failure. Seen
+ * in practice for rows with placeholder/test key material (e.g. a value
+ * containing `:`, which isn't a base64url character - an FCM registration
+ * token landing in the wrong field would fail the same way). Unlike a
+ * transient send failure, this can never succeed on retry - the stored
+ * bytes themselves are bad - so the caller treats it like an expired
+ * subscription (HTTP 404/410) and removes the row rather than counting it
+ * as a retryable failure forever.
+ */
+export class InvalidSubscriptionKeysError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InvalidSubscriptionKeysError";
+  }
+}
+
 function base64UrlToBytes(b64url) {
   const padded = b64url + "=".repeat((4 - (b64url.length % 4)) % 4);
   const bin = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
@@ -162,7 +180,19 @@ async function encryptAes128gcm({ payloadBytes, p256dhBase64, authBase64 }) {
  */
 export async function createWebPushRequest(subscription, payload, vapid) {
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
-  const body = await encryptAes128gcm({ payloadBytes, p256dhBase64: subscription.keys.p256dh, authBase64: subscription.keys.auth });
+  let body;
+  try {
+    body = await encryptAes128gcm({
+      payloadBytes,
+      p256dhBase64: subscription.keys?.p256dh,
+      authBase64: subscription.keys?.auth,
+    });
+  } catch (err) {
+    // Everything encryptAes128gcm touches besides the payload (which we
+    // built above and know is valid) traces back to subscription.keys - so
+    // any failure here means that data, not our own crypto code, is bad.
+    throw new InvalidSubscriptionKeysError(`malformed p256dh/auth key: ${err.message}`);
+  }
   const vapidHeaders = await buildVapidHeader({ endpoint: subscription.endpoint, ...vapid });
   return {
     url: subscription.endpoint,

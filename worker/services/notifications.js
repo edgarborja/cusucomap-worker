@@ -27,7 +27,7 @@
 // native app and a desktop browser for the same person are already two
 // separate rows before FCM ever entered the picture. A missing/failed
 // channel never blocks the other from sending.
-import { createWebPushRequest } from "./push-sender.js";
+import { createWebPushRequest, InvalidSubscriptionKeysError } from "./push-sender.js";
 import { sendFcmMessage } from "./fcm-sender.js";
 import { KIND_DEVICE_NOTIFY_CONFIG } from "../../shared/nostr-protocol.js";
 
@@ -322,6 +322,20 @@ export class NotificationsService {
       this.#logger.warn("push", `Web Push send failed (${result.status ?? result.error}): ${subscription.endpoint.slice(0, 60)}…`);
       return "failed";
     } catch (err) {
+      if (err instanceof InvalidSubscriptionKeysError) {
+        // Not a transient send failure - the stored key material itself is
+        // bad (e.g. placeholder/test data, or a device that ended up
+        // registered as "webpush" with non-webpush data - see
+        // push-sender.js's InvalidSubscriptionKeysError doc). It would fail
+        // identically on every future batch, so remove it now rather than
+        // count it as "failed" forever.
+        await this.#state.pushSubscriptions.delete(subscription.nostrPubkey);
+        this.#logger.warn(
+          "push",
+          `removed Web Push subscription for device ${subscription.nostrPubkey.slice(0, 8)}… - malformed keys (${err.message})`
+        );
+        return "removed";
+      }
       await this.#state.workerMetadata.increment("pushErrors");
       this.#logger.error("push", `Web Push send threw: ${err.message}`);
       return "failed";

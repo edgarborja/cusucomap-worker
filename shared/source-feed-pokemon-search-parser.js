@@ -62,7 +62,15 @@ export function parsePokesearchRecord(nodes) {
   const speciesStrong = strongs.find((s) => {
     const t = (s.textContent || "").trim();
     if (!t || /^[\d.]+$/.test(t)) return false;
-    if (/\bwithin\b.*km of\b/i.test(t)) return false;
+    // Excludes the reply's own "Found these Pokémon ...:" header line, in
+    // whatever variant it comes in ("within X km of ...", "with min IV
+    // X%", or any future filter-summary wording) - a real species name
+    // never starts with this, so a broad prefix check is safe. A record
+    // slice shouldn't normally still contain the header at all (see
+    // parsePokesearchReply's own hasHeader/start logic below), but this is
+    // a second, redundant check in case it ever does - see that mirrored
+    // regex's own comment for the bug this fixes.
+    if (/^Found these\b/i.test(t)) return false;
     return true;
   });
   const formSuffix = speciesStrong?.nextElementSibling?.textContent?.trim();
@@ -153,7 +161,16 @@ export function parsePokesearchReply(messageEl) {
   if (mapsLinkIndices.length === 0) return [];
 
   const firstStrong = contentEl.querySelector("strong");
-  const hasHeader = Boolean(firstStrong && /^Found these .*\bwithin\b.*km of/i.test(firstStrong.textContent || ""));
+  // Was narrowed to just the "within X km of ..." (geofiltered) header
+  // wording, which missed other filter-summary variants like "with min IV
+  // 100.0%:" (no location filter) - that header's own <strong> then got
+  // treated as the first record's content, and its text as that record's
+  // species (see parsePokesearchRecord's speciesStrong filter, which has
+  // the same broadened check as a second line of defense). A continuation
+  // message (a result set's 2nd+ message, always headerless - see
+  // "headerless continuation" elsewhere in this file) never starts with
+  // "Found these", so this stays safe to check broadly.
+  const hasHeader = Boolean(firstStrong && /^Found these\b/i.test(firstStrong.textContent || ""));
   let start = 0;
   if (hasHeader) {
     const idx = children.findIndex((n) => n === firstStrong || (n.contains && n.contains(firstStrong)));
@@ -219,7 +236,9 @@ export function parseRaidSearchReply(messageEl) {
   if (mapsLinkIndices.length === 0) return [];
 
   const firstStrong = contentEl.querySelector("strong");
-  const hasHeader = Boolean(firstStrong && /^Found these .*\bwithin\b.*km of/i.test(firstStrong.textContent || ""));
+  // Same broadened check as parsePokesearchReply's - see that one's
+  // comment for the bug a too-narrow "within X km of" pattern caused.
+  const hasHeader = Boolean(firstStrong && /^Found these\b/i.test(firstStrong.textContent || ""));
   let start = 0;
   if (hasHeader) {
     const idx = children.findIndex((n) => n === firstStrong || (n.contains && n.contains(firstStrong)));

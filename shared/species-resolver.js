@@ -25,6 +25,18 @@ export function normalizeSpeciesKey(raw) {
 // this map as more otherwise-unresolved species turn up in the activity log.
 const SPECIES_SLUG_OVERRIDES = { giratina: "giratina-altered" };
 
+// Unown is a different case from the override map above: its letter forms
+// aren't separate PokeAPI "pokemon" entries at all (confirmed live -
+// /pokemon/unown-d 404s; only the single base /pokemon/unown, id 201,
+// always Psychic, exists) - the letter is purely a sprite variant, named
+// "<id>-<letter>.png" in the same sprites repo this file already pulls
+// from (confirmed live: sprites/pokemon/201-d.png exists, 201.png is
+// just the plain/undifferentiated icon). normalizeSpeciesKey already turns
+// "Unown (D)" into "unown-d", conveniently identical to PokeAPI's own
+// per-letter form name - matched here to resolve the base species
+// normally, then swap in the form-specific sprite filename.
+const UNOWN_FORM_RE = /^unown-([a-z])$/;
+
 const memoryCache = new Map();
 /** No-op-persistent default cache; pass a `{get,set}` backed by ApplicationState.workerMetadata for real persistence (see worker/connectors/source-feed-connector.js). */
 const defaultCache = {
@@ -47,12 +59,14 @@ export async function resolveSpecies(speciesRaw, cache = defaultCache) {
   const cached = await cache.get(`species:${key}`);
   if (cached !== null && cached !== undefined) return cached;
 
-  const slug = SPECIES_SLUG_OVERRIDES[key] || key;
+  const unownLetter = key.match(UNOWN_FORM_RE)?.[1];
+  const slug = SPECIES_SLUG_OVERRIDES[key] || (unownLetter ? "unown" : key);
   try {
     const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    const result = { spriteUrl: `${SPRITE_BASE}${data.id}.png`, types: (data.types ?? []).map((t) => t.type.name) };
+    const spriteId = unownLetter ? `${data.id}-${unownLetter}` : String(data.id);
+    const result = { spriteUrl: `${SPRITE_BASE}${spriteId}.png`, types: (data.types ?? []).map((t) => t.type.name) };
     await cache.set(`species:${key}`, result);
     return result;
   } catch (err) {
