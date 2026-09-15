@@ -178,6 +178,67 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
   }
 });
 
+// Mirrors worker/core/area-scan.js's countAreaScanCircles - inlined here
+// rather than imported since it's a one-line closed form (1 center + 6k
+// points per ring, k=1..rings) and this page has no other reason to
+// depend on that module (the actual lattice is computed worker-side, over
+// runAreaScan - see worker-app.js).
+function areaScanCircleCount(rings) {
+  return 1 + 3 * rings * (rings + 1);
+}
+
+function updateAreaScanPreview() {
+  const rings = Number(document.getElementById("area-scan-rings").value);
+  const preview = document.getElementById("area-scan-preview");
+  preview.textContent = Number.isInteger(rings) && rings >= 1 && rings <= 5 ? `${areaScanCircleCount(rings)} commands.` : "";
+}
+document.getElementById("area-scan-rings").addEventListener("input", updateAreaScanPreview);
+updateAreaScanPreview();
+
+document.getElementById("area-scan-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const errorEl = document.getElementById("area-scan-error");
+  const statusEl = document.getElementById("area-scan-status");
+  errorEl.hidden = true;
+
+  const [latText, lonText] = document.getElementById("area-scan-center").value.trim().split(",").map((s) => s.trim());
+  const centerLat = Number(latText);
+  const centerLon = Number(lonText);
+  const radiusKmText = document.getElementById("area-scan-radius").value.trim();
+  const radiusKm = Number(radiusKmText);
+  const rings = Number(document.getElementById("area-scan-rings").value);
+
+  if (!Number.isFinite(centerLat) || !Number.isFinite(centerLon)) {
+    errorEl.textContent = 'Center point must be "lat,lon".';
+    errorEl.hidden = false;
+    return;
+  }
+  if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) {
+    errorEl.textContent = "Scan radius must be a positive number.";
+    errorEl.hidden = false;
+    return;
+  }
+  if (!Number.isInteger(rings) || rings < 1 || rings > 5) {
+    errorEl.textContent = "Rings must be an integer from 1 to 5.";
+    errorEl.hidden = false;
+    return;
+  }
+
+  const total = areaScanCircleCount(rings);
+  if (!confirm(`Start an area scan of ${total} commands? This takes priority over the worker's normal schedule until it finishes.`)) return;
+
+  statusEl.textContent = "Starting…";
+  statusEl.hidden = false;
+  try {
+    const result = await callSelf("runAreaScan", { centerLat, centerLon, radiusKmText, rings });
+    statusEl.textContent = `Started - ${result.total} commands queued. Watch the worker's own activity log for progress.`;
+  } catch (err) {
+    statusEl.hidden = true;
+    errorEl.textContent = `Failed to start: ${err.message}`;
+    errorEl.hidden = false;
+  }
+});
+
 document.getElementById("save-button").addEventListener("click", async () => {
   const errorEl = document.getElementById("save-error");
   const statusEl = document.getElementById("save-status");

@@ -64,6 +64,31 @@
       <span id="save-status" hidden></span>
     </p>
     <p id="save-error" class="error" hidden></p>
+
+    <div class="panel">
+      <h2>Area scan <span class="hint">(one-time - runs now, doesn't touch the loop above)</span></h2>
+      <p class="lede">
+        Covers a wide area by splitting it into many small, overlapping <code>/pokesearch</code> queries in a
+        hex-packed pattern, since a single query caps out at a limited number of results. Sends immediately with
+        priority over the worker's normal schedule; progress only shows up in the worker's own activity log, not
+        here.
+      </p>
+      <form id="area-scan-form">
+        <label>Center point (lat,lon)
+          <input id="area-scan-center" type="text" placeholder="13.675873,-89.281163" />
+        </label>
+        <label>Per-circle scan radius (km)
+          <input id="area-scan-radius" type="text" placeholder="0.1" />
+        </label>
+        <label>Rings
+          <input id="area-scan-rings" type="number" min="1" max="5" step="1" value="1" />
+        </label>
+        <p id="area-scan-preview" class="hint"></p>
+        <button id="area-scan-start" type="submit">Start area scan</button>
+        <span id="area-scan-status" hidden></span>
+      </form>
+      <p id="area-scan-error" class="error" hidden></p>
+    </div>
   </section>
 </main>
 

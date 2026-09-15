@@ -19,6 +19,7 @@ import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
 import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
+import { generateHexLattice, buildAreaScanCommand } from "./core/area-scan.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
 
 const WORKER_STATUS_INTERVAL_MS = 60_000;
@@ -329,6 +330,44 @@ async function startWorker(publicConfig, secretConfig) {
   rpc.handle("setAhkCommands", async (params, { fromPubkey }) => {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
     return ahkConnector.applyCommands(params ?? {});
+  });
+  // Starts a bulk area scan (see commands/commands-app.js's "Area scan"
+  // section and worker/core/area-scan.js) and returns as soon as it's
+  // *started*, not once it finishes - a scan can run for many minutes
+  // (dozens of /pokesearch commands, each with its own settle pause), far
+  // longer than an RPC round trip over Nostr relays should ever block for.
+  // Progress/completion only ever shows up in this worker's own activity
+  // log (each command send already logs itself - see AhkConnector's own
+  // #sendSerialized), same as the local dashboard's bulk-scan sections;
+  // there's no live progress channel back to the caller.
+  rpc.handle("runAreaScan", async (params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+
+    const centerLat = Number(params?.centerLat);
+    const centerLon = Number(params?.centerLon);
+    const radiusKmText = String(params?.radiusKmText ?? "").trim();
+    const radiusKm = Number(radiusKmText);
+    const rings = Number(params?.rings);
+
+    if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return { ok: false, error: "centerLat must be a number between -90 and 90." };
+    if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return { ok: false, error: "centerLon must be a number between -180 and 180." };
+    if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return { ok: false, error: "radiusKmText must be a positive number." };
+    if (!Number.isInteger(rings) || rings < 1 || rings > 5) return { ok: false, error: "rings must be an integer between 1 and 5." };
+    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
+
+    const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
+    // Deliberately not awaited - see this handler's own doc comment above.
+    ahkControls
+      .enableThenRun(() => ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })]))
+      .then((result) => {
+        logger.info(
+          "ahk",
+          result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
+        );
+      })
+      .catch((err) => logger.error("ahk", `area scan failed: ${err.message}`));
+
+    return { ok: true, total: points.length };
   });
   rpc.start();
 
