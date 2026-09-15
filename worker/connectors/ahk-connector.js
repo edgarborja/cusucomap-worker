@@ -250,6 +250,23 @@ export class AhkConnector {
   }
 
   /**
+   * Sends `message` and a separate {Enter} hotkey press back-to-back - some
+   * real Discord slash commands need Enter pressed twice (the first only
+   * accepts the autocomplete/subcommand selection, it doesn't submit). Both
+   * #sendSerialized calls MUST be issued here with no `await` between them:
+   * otherwise some other queued sender (a scheduled search, another daily
+   * command) could grab the chain slot between the command and its second
+   * Enter - see #sendChain's own comment for the incident that first
+   * surfaced this, and watch-channel-connector.js's #handleAlert for the
+   * same reasoning applied to a hotkey+sequence pair instead.
+   */
+  #sendDoubleEnter(message, pause) {
+    const commandSend = this.#sendSerialized(message, pause);
+    const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
+    return Promise.all([commandSend, enterSend]);
+  }
+
+  /**
    * Sends a list of messages back-to-back, pacing between them - used for
    * the watch-channel connector's out-of-schedule "scan now" (see
    * watch-channel-connector.js). Everything here still goes through the
@@ -329,17 +346,8 @@ export class AhkConnector {
           // scheduled search racing into the same compose box).
           const pause = { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS };
           // Every daily command is a real Discord slash command, which needs
-          // Enter pressed twice - the first only accepts the autocomplete/
-          // subcommand selection, it doesn't submit. Reuses the existing
-          // hotkey path rather than teaching AHK a new command type: queue
-          // the command, then queue a plain "{Enter}" hotkey right after it.
-          // Both #sendSerialized calls MUST be issued here with no `await`
-          // between them, same reasoning as watch-channel-connector.js's
-          // #handleAlert - otherwise a scheduled search could grab the chain
-          // slot between the command and its second Enter.
-          const commandSend = this.#sendSerialized(cmd.message, pause);
-          const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
-          await Promise.all([commandSend, enterSend]);
+          // Enter pressed twice - see #sendDoubleEnter's own comment.
+          await this.#sendDoubleEnter(cmd.message, pause);
           await this.#state.workerMetadata.set(sentKey, true);
           this.#logger.info("ahk", `sent daily command "${label}"`);
         }
@@ -374,9 +382,17 @@ export class AhkConnector {
    * @param {object[]} locations
    * @param {(location: object) => string[]} buildRowCommands
    * @param {(sent: number, total: number) => void} [onProgress]
+   * @param {{ beforeCommand?: string, afterCommand?: string }} [wrap] - only
+   *   the area scan uses these (see worker-app.js's runAreaScan): a command
+   *   to send (double Enter - see #sendDoubleEnter) before the location loop
+   *   starts, and one to send (single Enter) after it ends, whether it ran
+   *   to completion or was cancelled - both still inside the priority gate,
+   *   so neither can be interleaved with the scheduled loop resuming. The
+   *   "after" send is best-effort (logged, not thrown) so a failure here
+   *   can't mask whatever error the main loop itself hit.
    * @returns {Promise<{sent: number, total: number, cancelled: boolean}>}
    */
-  async runBulkScan(locations, buildRowCommands, onProgress) {
+  async runBulkScan(locations, buildRowCommands, onProgress, { beforeCommand, afterCommand } = {}) {
     if (this.#bulkScanActive) throw new Error("A scan is already running.");
     this.#bulkScanActive = true;
     this.#bulkScanCancelRequested = false;
@@ -391,6 +407,7 @@ export class AhkConnector {
     let sent = 0;
     let cancelled = false;
     try {
+      if (beforeCommand) await this.#sendDoubleEnter(beforeCommand, pause);
       scanLoop: for (const location of locations) {
         for (const message of buildRowCommands(location)) {
           if (!this.#running || this.#bulkScanCancelRequested) {
@@ -403,6 +420,13 @@ export class AhkConnector {
         }
       }
     } finally {
+      if (afterCommand) {
+        try {
+          await this.#sendSerialized(afterCommand, pause);
+        } catch (err) {
+          this.#logger.error("ahk", `bulk scan cleanup command failed: ${err.message}`);
+        }
+      }
       this.#bulkScanActive = false;
       this.#bulkScanCancelRequested = false;
       releaseGate();

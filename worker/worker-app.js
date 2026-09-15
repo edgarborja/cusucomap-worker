@@ -62,12 +62,18 @@ const AHK_ENABLE_GRACE_MS = 5_000;
  * clipboard-paste path did. Clicking again during the countdown cancels it.
  * @returns {{ isEnabled: () => boolean, enableThenRun: (syncCallback: () => unknown) => Promise<unknown> }}
  */
-function wireAhkControls({ ahkConnector, logger }) {
+function wireAhkControls({ ahkConnector, logger, getConfig }) {
   const toggleButton = document.getElementById("ahk-toggle");
   const statusEl = document.getElementById("ahk-status");
   let enabled = false;
   let countdownTimer = null;
   let cancelCurrentEnable = null;
+  // Only the very first enable of this page load sends the geofilter
+  // safety-net reset (see defaultAhkConfig's own comment on
+  // defaultGeofilterCommand) - a later disable/re-enable within the same
+  // session isn't the "worker got interrupted mid-scan" case this exists
+  // for, so it shouldn't re-fire every time.
+  let startupGeofilterResetSent = false;
 
   function setDisabled() {
     clearTimeout(countdownTimer);
@@ -121,6 +127,17 @@ function wireAhkControls({ ahkConnector, logger }) {
           toggleButton.textContent = "Disable AHK";
           statusEl.textContent = "Enabled";
           logger.info("ahk", "AHK enabled - sending scheduled/daily/manual commands.");
+          if (!startupGeofilterResetSent) {
+            startupGeofilterResetSent = true;
+            // Not awaited - same "no await gap before syncCallback" reasoning
+            // as this function's own doc comment above: sendCustomCommand
+            // still queues onto the same #sendChain as syncCallback's own
+            // first send (e.g. an area scan's beforeCommand), so ordering
+            // between the two is preserved without blocking this tick.
+            ahkConnector
+              .sendCustomCommand(getConfig().defaultGeofilterCommand)
+              .catch((err) => logger.error("ahk", `startup geofilter reset failed: ${err.message}`));
+          }
           resolve(syncCallback());
           return;
         }
@@ -252,7 +269,7 @@ async function startWorker(publicConfig, secretConfig) {
 
   const ahkTransport = new AhkTransport();
   const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: defaultAhkConfig, ahkTransport });
-  const ahkControls = wireAhkControls({ ahkConnector, logger });
+  const ahkControls = wireAhkControls({ ahkConnector, logger, getConfig: defaultAhkConfig });
 
   const watchChannelConnector = new WatchChannelConnector({
     bus,
@@ -356,9 +373,15 @@ async function startWorker(publicConfig, secretConfig) {
     if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
 
     const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
+    const { areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
     // Deliberately not awaited - see this handler's own doc comment above.
     ahkControls
-      .enableThenRun(() => ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })]))
+      .enableThenRun(() =>
+        ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
+          beforeCommand: areaScanClearGeofilterCommand,
+          afterCommand: defaultGeofilterCommand,
+        })
+      )
       .then((result) => {
         logger.info(
           "ahk",

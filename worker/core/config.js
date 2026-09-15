@@ -101,6 +101,19 @@ export function defaultAhkConfig() {
     // marks every channel read - sent as one queued item via the "#HOTKEY# "
     // sentinel, after the priority scan above finishes.
     clearUnreadHotkey: "+{Escape}",
+    // Sent (with a doubled Enter - see ahk-connector.js's #sendDoubleEnter)
+    // immediately before an area scan's own per-circle searches start - each
+    // of those already carries its own explicit query area, so a leftover
+    // geofilter from before the scan would otherwise interact with them
+    // unpredictably.
+    areaScanClearGeofilterCommand: "/pokeset geofilter clear:confirm",
+    // Restores the normal working geofilter: sent (single Enter) right
+    // after an area scan finishes or is cancelled, before the normal
+    // schedule resumes - and also once at worker startup on the very first
+    // AHK enable, in case a previous run got interrupted mid-scan and left
+    // the geofilter cleared. See worker-app.js's runAreaScan RPC handler
+    // and wireAhkControls' own startup hook.
+    defaultGeofilterCommand: "/pokeset geofilter radius:10km center:13.677440,-89.283353",
   };
 }
 
