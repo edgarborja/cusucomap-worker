@@ -477,8 +477,7 @@ async function startWorker(publicConfig, secretConfig) {
     async function finishPool() {
       if (!scanId) return;
       activeScanId = null;
-      const pool = await state.pendingScanPools.get(scanId);
-      if (pool && pool.status === "collecting") await state.pendingScanPools.put({ ...pool, status: "pending" });
+      await state.pendingScanPools.markCollectingAsPending(scanId);
     }
 
     // Deliberately not awaited - see this handler's own doc comment above.

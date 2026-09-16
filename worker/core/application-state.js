@@ -228,6 +228,27 @@ class PendingScanPoolStore {
     });
     return this.#appendChain;
   }
+
+  /**
+   * Marks a still-"collecting" pool "pending" (ready for review) once its
+   * scan has finished sending commands - see worker-app.js's runAreaScan/
+   * finishPool. MUST go through the same #appendChain as appendSpawn, not
+   * its own independent get-then-put: a late-arriving reply's appendSpawn
+   * call can still be queued (in flight) at the exact moment this runs, and
+   * an unserialized write here could land in either order relative to it -
+   * if the append's own read happened before this write landed, its write
+   * back would silently revert the status to "collecting" again, and the
+   * pool would then never visibly finish. Chaining this here guarantees
+   * every append already queued lands first, and none queued after this
+   * call can undo it.
+   */
+  markCollectingAsPending(scanId) {
+    this.#appendChain = this.#appendChain.then(async () => {
+      const pool = await this.#collection.get(scanId);
+      if (pool && pool.status === "collecting") await this.#collection.put({ ...pool, status: "pending" });
+    });
+    return this.#appendChain;
+  }
 }
 
 class ProcessedEventStore {
