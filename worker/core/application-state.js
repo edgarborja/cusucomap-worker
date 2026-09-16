@@ -184,6 +184,12 @@ class ScanSubscriberStore {
  */
 class PendingScanPoolStore {
   #collection;
+  // Serializes appendSpawn calls - see that method's own comment for why
+  // this exists. Not per-scanId: only one bulk scan can ever be active at
+  // a time (AhkConnector's own #bulkScanActive guard), so there is never
+  // more than one pool being appended to concurrently anyway - one shared
+  // chain is enough.
+  #appendChain = Promise.resolve();
   constructor(collection) {
     this.#collection = collection;
   }
@@ -199,11 +205,28 @@ class PendingScanPoolStore {
   async all() {
     return this.#collection.getAll();
   }
-  /** Read-modify-write: appends one spawn to a still-collecting pool. No-op if the pool doesn't exist (e.g. it was somehow discarded mid-scan). */
-  async appendSpawn(scanId, spawn) {
-    const pool = await this.#collection.get(scanId);
-    if (!pool) return;
-    await this.#collection.put({ ...pool, spawns: [...pool.spawns, spawn] });
+  /**
+   * Read-modify-write: appends one spawn to a still-collecting pool. No-op
+   * if the pool doesn't exist (e.g. it was somehow discarded mid-scan).
+   *
+   * MUST be serialized, not called as independent get-then-put pairs: a
+   * single multi-pokemon message calls this once per record, all at once,
+   * via source-feed-connector.js's own `Promise.all(pokesearchResults.map(
+   * (spawn, i) => this.#emitSpawn(...)))` - so two or more calls for the
+   * same scanId routinely overlap in practice, not just in theory. Without
+   * this chain, each overlapping call reads the same stale `pool.spawns`
+   * snapshot and writes back its own single addition, and the last one to
+   * finish silently clobbers every other one's write - confirmed as a real
+   * cause of under-counted scan results (most records from any message
+   * with 2+ pokemon in it were being lost this way).
+   */
+  appendSpawn(scanId, spawn) {
+    this.#appendChain = this.#appendChain.then(async () => {
+      const pool = await this.#collection.get(scanId);
+      if (!pool) return;
+      await this.#collection.put({ ...pool, spawns: [...pool.spawns, spawn] });
+    });
+    return this.#appendChain;
   }
 }
 
