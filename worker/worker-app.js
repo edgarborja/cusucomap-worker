@@ -507,6 +507,10 @@ async function startWorker(publicConfig, secretConfig) {
     // start a scan). No human-facing text here on purpose - presentation
     // (copy, language, UI) is entirely the viewer's concern; `ok: true`
     // plus `scanId` is a complete, unambiguous structured signal on its own.
+    logger.info(
+      "worker",
+      `area scan request from ${fromPubkey.slice(0, 8)}… accepted (${auth.isSelf ? "operator" : "subscriber, cusuco charged"}) - ack sent (scanId=${scanId ?? "n/a"}, ${points.length} commands)`
+    );
     return { ok: true, total: points.length, scanId };
   });
 
