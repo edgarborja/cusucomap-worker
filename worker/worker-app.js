@@ -424,11 +424,23 @@ async function startWorker(publicConfig, secretConfig) {
   // that call carries no spawn data at all, only the id, so there is no way
   // for a caller to inject anything into what gets broadcast.
   rpc.handle("runAreaScan", async (params, { fromPubkey }) => {
+    // Validated *before* authorizeScanRequest, deliberately - that call is
+    // what charges one cusuco against a non-self caller's daily quota, and
+    // a subscriber must never be charged for a request that was going to
+    // be rejected anyway. Only centerLat/centerLon and "is a scan already
+    // running" can be checked this early - radiusKmText/rings depend on
+    // auth.isSelf, so those stay validated after (they can never actually
+    // fail for a subscriber, since their values are always the fixed
+    // server-side constants below, not anything the caller supplied).
+    const centerLat = Number(params?.centerLat);
+    const centerLon = Number(params?.centerLon);
+    if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return { ok: false, error: "centerLat must be a number between -90 and 90." };
+    if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return { ok: false, error: "centerLon must be a number between -180 and 180." };
+    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
+
     const auth = await authorizeScanRequest(fromPubkey);
     if (!auth.ok) return { ok: false, error: auth.error };
 
-    const centerLat = Number(params?.centerLat);
-    const centerLon = Number(params?.centerLon);
     const { subscriberScanRadiusKmText, areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
     // A subscriber never controls the per-circle radius or ring count -
     // both fixed server-side regardless of what's sent, not just a
@@ -438,12 +450,8 @@ async function startWorker(publicConfig, secretConfig) {
     const radiusKmText = auth.isSelf ? String(params?.radiusKmText ?? "").trim() : subscriberScanRadiusKmText;
     const radiusKm = Number(radiusKmText);
     const rings = auth.isSelf ? Number(params?.rings) : 1;
-
-    if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return { ok: false, error: "centerLat must be a number between -90 and 90." };
-    if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return { ok: false, error: "centerLon must be a number between -180 and 180." };
     if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return { ok: false, error: "radiusKmText must be a positive number." };
     if (!Number.isInteger(rings) || rings < 1 || rings > 5) return { ok: false, error: "rings must be an integer between 1 and 5." };
-    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
 
     const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
 
@@ -493,6 +501,13 @@ async function startWorker(publicConfig, secretConfig) {
         await finishPool();
       });
 
+    // The ack itself - returned as soon as the cusuco is charged and the
+    // scan is confirmed to actually be starting (see the reordering above:
+    // by this point every rejection path has already returned, so a
+    // caller that gets this response really was charged and really did
+    // start a scan). No human-facing text here on purpose - presentation
+    // (copy, language, UI) is entirely the viewer's concern; `ok: true`
+    // plus `scanId` is a complete, unambiguous structured signal on its own.
     return { ok: true, total: points.length, scanId };
   });
 

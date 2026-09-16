@@ -309,7 +309,20 @@ export class SourceFeedConnector {
     // getActiveScanId() is only ever set for a non-self requester.
     const activeScanId = this.#getActiveScanId();
     if (activeScanId) {
-      await this.#state.pendingScanPools.appendSpawn(activeScanId, normalized);
+      // stableIntId(stableSpawnKey(...)) (already computed above, as `id`)
+      // is deterministic per real-world spawn - the same species/coords/cp
+      // always produces the same id regardless of which search turned it
+      // up. That's what lets "already public knowledge" mean something
+      // concrete here: if this exact spawn is already active state.spawns
+      // (published from some earlier search, in or out of a scan), it
+      // isn't a new discovery for this subscriber to take credit for -
+      // skip adding it to their pool rather than showing them something
+      // that's already on the public map. An expired/despawned prior
+      // sighting under the same id doesn't count as "known" - it's no
+      // longer visible to anyone, so this sighting is worth surfacing.
+      const existing = await this.#state.spawns.get(normalized.id);
+      const alreadyKnown = Boolean(existing) && existing.status === "active" && new Date(existing.despawnAt).getTime() > Date.now();
+      if (!alreadyKnown) await this.#state.pendingScanPools.appendSpawn(activeScanId, normalized);
       return;
     }
     this.#bus.emit("spawn.observed", normalized);
