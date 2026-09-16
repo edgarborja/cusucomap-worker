@@ -7,6 +7,25 @@ import { validateSpawn, validateQuest, validateRaid } from "../../shared/schemas
 
 const SWEEP_INTERVAL_MS = 60_000;
 
+// How long past its own expiry an entity sticks around before actually
+// being deleted (not just status-flipped - see sweepExpired vs
+// pruneOlderThan in application-state.js) - keeps the local database from
+// growing forever. Deliberately independent of any backup/export cadence:
+// this data already did its real job the moment it was published live: the
+// local copy past this point is only ever an audit trail, not the primary
+// distribution path, so there's no need to gate deletion on a backup first
+// existing.
+const RETENTION_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const RETENTION_LAST_RUN_KEY = "retentionTrimLastRunDate";
+
+// Local calendar date, matching ahk-connector.js's own todayKey() (not
+// duplicated as a shared helper - it's three lines, and this file has no
+// other reason to depend on that one).
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 export class PokemonStateService {
   #state;
   #bus;
@@ -26,7 +45,55 @@ export class PokemonStateService {
     setInterval(async () => {
       const expired = (await this.#state.spawns.sweepExpired()) + (await this.#state.raids.sweepExpired()) + (await this.#state.fieldResearch.sweepExpired());
       if (expired > 0) this.#logger.info("pokemon-state", `expired ${expired} entities`);
+      await this.#runRetentionTrimIfDue();
+      await this.#discardStalePendingScanPools();
     }, SWEEP_INTERVAL_MS);
+  }
+
+  /**
+   * Discards a still-unapproved, *finished* scan pool (see worker-app.js's
+   * runAreaScan/getScanResults/approveScanResults) once every spawn it
+   * holds has despawned - at that point it's no more useful than an empty
+   * one. Checked on this same 60s tick rather than the once-daily retention
+   * trim, since a pool's own relevance window is minutes, not a day.
+   * Deliberately skips anything not "pending": a "collecting" pool is still
+   * owned by an in-flight runAreaScan call (an empty spawns array there
+   * would otherwise look "all despawned" and get deleted out from under a
+   * scan that's still running), and an already-"broadcast" pool is kept as
+   * a record, same as an approved scan's spawns already are in
+   * state.spawns itself.
+   */
+  async #discardStalePendingScanPools() {
+    const pools = await this.#state.pendingScanPools.all();
+    const now = Date.now();
+    let discarded = 0;
+    for (const pool of pools) {
+      if (pool.status !== "pending") continue;
+      const stillLive = pool.spawns.some((s) => new Date(s.despawnAt).getTime() > now);
+      if (stillLive) continue;
+      await this.#state.pendingScanPools.delete(pool.scanId);
+      discarded++;
+    }
+    if (discarded > 0) this.#logger.info("pokemon-state", `discarded ${discarded} stale pending scan pool(s)`);
+  }
+
+  /**
+   * Once per calendar day (checked on this same 60s tick, not a separate
+   * timer - a missed midnight tick just means it runs on the next one),
+   * actually deletes spawns/raids/field research whose expiry passed more
+   * than RETENTION_MAX_AGE_MS ago. Never touches scanSubscribers,
+   * pushSubscriptions, workerMetadata, or pendingScanPools - those aren't
+   * despawning entities and have their own separate lifecycle rules.
+   */
+  async #runRetentionTrimIfDue() {
+    const today = todayKey();
+    if ((await this.#state.workerMetadata.get(RETENTION_LAST_RUN_KEY, null)) === today) return;
+    await this.#state.workerMetadata.set(RETENTION_LAST_RUN_KEY, today);
+    const removed =
+      (await this.#state.spawns.pruneOlderThan(RETENTION_MAX_AGE_MS)) +
+      (await this.#state.raids.pruneOlderThan(RETENTION_MAX_AGE_MS)) +
+      (await this.#state.fieldResearch.pruneOlderThan(RETENTION_MAX_AGE_MS));
+    if (removed > 0) this.#logger.info("pokemon-state", `daily retention trim: removed ${removed} entities expired 2h+ ago`);
   }
 
   /**

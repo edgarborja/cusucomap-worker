@@ -20,6 +20,8 @@ import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
 import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
 import { generateHexLattice, buildAreaScanCommand } from "./core/area-scan.js";
+import { exportAllData } from "./storage/indexeddb.js";
+import { crc16Tag } from "../shared/crc16.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
 
 const WORKER_STATUS_INTERVAL_MS = 60_000;
@@ -29,6 +31,26 @@ function parseLines(text) {
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
+}
+
+// Local calendar date - matches ahk-connector.js's own todayKey() and
+// pokemon-state.js's own copy; not worth a shared helper for three lines.
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** @returns {string} pubkey hex. Throws if `npub` isn't a valid npub. */
+function decodeNpub(npub) {
+  if (!window.NostrTools) throw new Error("NostrTools global not found.");
+  const decoded = window.NostrTools.nip19.decode(String(npub ?? "").trim());
+  if (decoded.type !== "npub") throw new Error("not an npub");
+  return decoded.data;
+}
+
+function encodeNpub(pubkeyHex) {
+  if (!window.NostrTools) throw new Error("NostrTools global not found.");
+  return window.NostrTools.nip19.npubEncode(pubkeyHex);
 }
 
 /** Publishes an entity that just became authoritative (created/updated) - the only place connecting ApplicationState changes to the Nostr transport, per the brief's "central state layer decides what becomes visible" requirement. */
@@ -264,7 +286,20 @@ async function startWorker(publicConfig, secretConfig) {
   const pokemonState = new PokemonStateService({ state, bus, logger });
   pokemonState.start();
 
-  const sourceFeedConnector = new SourceFeedConnector({ bus, logger, state, getGeofilterAnchor: () => publicConfig.geofilterAnchor, getTrackedChannelIds: () => publicConfig.trackedChannelIds });
+  // Set only for the duration of a subscriber-requested scan's own
+  // bulk-scan-priority window (see runAreaScan below and
+  // source-feed-connector.js's #emitSpawn) - null otherwise, including for
+  // the operator's own (self) scans.
+  let activeScanId = null;
+
+  const sourceFeedConnector = new SourceFeedConnector({
+    bus,
+    logger,
+    state,
+    getGeofilterAnchor: () => publicConfig.geofilterAnchor,
+    getTrackedChannelIds: () => publicConfig.trackedChannelIds,
+    getActiveScanId: () => activeScanId,
+  });
   sourceFeedConnector.start();
 
   const ahkTransport = new AhkTransport();
@@ -348,23 +383,61 @@ async function startWorker(publicConfig, secretConfig) {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
     return ahkConnector.applyCommands(params ?? {});
   });
+  // A subscriber's own dailyLimit (set via setScanSubscriber's admin panel
+  // field) overrides the fleet-wide default - absent/null means "use the
+  // default", not "zero". Centralized here so authorizeScanRequest and
+  // checkScanSubscription's own cusucosRemaining can never drift apart on
+  // what "the limit" actually means for a given subscriber.
+  function resolveSubscriberDailyLimit(subscriber) {
+    return subscriber?.dailyLimit ?? defaultAhkConfig().scanDailyLimitPerSubscriber;
+  }
+
+  // Authorizes a scan request (runAreaScan, and later runSpeciesScan) and,
+  // for a non-self caller, charges one scan against their daily "cusuco"
+  // quota in the same call - see worker/storage/indexeddb.js's own comment
+  // on why this ledger is its own store, never merged into
+  // pushSubscriptions. The operator's own (self) requests are always
+  // allowed, unlimited, no quota touched.
+  async function authorizeScanRequest(fromPubkey) {
+    if (fromPubkey === transport.identity.hex) return { ok: true, isSelf: true };
+    const subscriber = await state.scanSubscribers.get(fromPubkey);
+    if (!subscriber) return { ok: false, error: "no scan subscription found for this account." };
+    if (new Date(subscriber.activeUntil).getTime() < Date.now()) return { ok: false, error: "scan subscription has expired." };
+    const today = todayKey();
+    const usedToday = subscriber.scansUsedDate === today ? (subscriber.scansUsedToday ?? 0) : 0;
+    if (usedToday >= resolveSubscriberDailyLimit(subscriber)) return { ok: false, error: "daily scan limit reached - resets tomorrow." };
+    await state.scanSubscribers.put({ ...subscriber, scansUsedToday: usedToday + 1, scansUsedDate: today });
+    return { ok: true, isSelf: false };
+  }
+
   // Starts a bulk area scan (see commands/commands-app.js's "Area scan"
   // section and worker/core/area-scan.js) and returns as soon as it's
   // *started*, not once it finishes - a scan can run for many minutes
   // (dozens of /pokesearch commands, each with its own settle pause), far
   // longer than an RPC round trip over Nostr relays should ever block for.
-  // Progress/completion only ever shows up in this worker's own activity
-  // log (each command send already logs itself - see AhkConnector's own
-  // #sendSerialized), same as the local dashboard's bulk-scan sections;
-  // there's no live progress channel back to the caller.
+  // For the operator's own (self) request, this is unchanged from before:
+  // results publish immediately and normally, no pool involved. For a
+  // subscriber, results instead land in a private pendingScanPools row
+  // (see source-feed-connector.js's #emitSpawn) that only they (or the
+  // operator) can read back via getScanResults, and only they (or the
+  // operator) can make public via approveScanResults - the request body of
+  // that call carries no spawn data at all, only the id, so there is no way
+  // for a caller to inject anything into what gets broadcast.
   rpc.handle("runAreaScan", async (params, { fromPubkey }) => {
-    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    const auth = await authorizeScanRequest(fromPubkey);
+    if (!auth.ok) return { ok: false, error: auth.error };
 
     const centerLat = Number(params?.centerLat);
     const centerLon = Number(params?.centerLon);
-    const radiusKmText = String(params?.radiusKmText ?? "").trim();
+    const { subscriberScanRadiusKmText, areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
+    // A subscriber never controls the per-circle radius or ring count -
+    // both fixed server-side regardless of what's sent, not just a
+    // client-side limit, since a self-crafted request could otherwise ask
+    // for anything. Only the operator's own (self) scans may set their own
+    // radius and use the full 1-5 ring range.
+    const radiusKmText = auth.isSelf ? String(params?.radiusKmText ?? "").trim() : subscriberScanRadiusKmText;
     const radiusKm = Number(radiusKmText);
-    const rings = Number(params?.rings);
+    const rings = auth.isSelf ? Number(params?.rings) : 1;
 
     if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return { ok: false, error: "centerLat must be a number between -90 and 90." };
     if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return { ok: false, error: "centerLon must be a number between -180 and 180." };
@@ -373,7 +446,33 @@ async function startWorker(publicConfig, secretConfig) {
     if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
 
     const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
-    const { areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
+
+    const scanId = auth.isSelf ? null : crypto.randomUUID();
+    if (scanId) {
+      activeScanId = scanId;
+      // Not awaited - awaiting this here would delay the enableThenRun()
+      // call below by at least a tick, which is exactly the race that
+      // function's own doc comment (and AhkConnector#runBulkScan's
+      // identical "no await gap" reasoning) exists to prevent: the
+      // scheduled loop's own already-suspended continuation only re-checks
+      // #bulkScanGate at the top of its next iteration, so any gap here is
+      // a window for it to queue a send first, stealing this scan's
+      // priority. A local IndexedDB write completes in well under a
+      // millisecond in practice, long before the scan's own
+      // beforeCommand+settle-pause+first-search could possibly produce a
+      // spawn for #emitSpawn to append to this pool.
+      state.pendingScanPools
+        .put({ scanId, scanType: "area", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
+        .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
+    }
+
+    async function finishPool() {
+      if (!scanId) return;
+      activeScanId = null;
+      const pool = await state.pendingScanPools.get(scanId);
+      if (pool && pool.status === "collecting") await state.pendingScanPools.put({ ...pool, status: "pending" });
+    }
+
     // Deliberately not awaited - see this handler's own doc comment above.
     ahkControls
       .enableThenRun(() =>
@@ -382,15 +481,172 @@ async function startWorker(publicConfig, secretConfig) {
           afterCommand: defaultGeofilterCommand,
         })
       )
-      .then((result) => {
+      .then(async (result) => {
         logger.info(
           "ahk",
           result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
         );
+        await finishPool();
       })
-      .catch((err) => logger.error("ahk", `area scan failed: ${err.message}`));
+      .catch(async (err) => {
+        logger.error("ahk", `area scan failed: ${err.message}`);
+        await finishPool();
+      });
 
-    return { ok: true, total: points.length };
+    return { ok: true, total: points.length, scanId };
+  });
+
+  // Lets the requester (or the operator) read back a scan's private
+  // results - this is the entire "private delivery" channel: nothing about
+  // a subscriber's scan is ever public until approveScanResults is called.
+  rpc.handle("getScanResults", async (params, { fromPubkey }) => {
+    const pool = params?.scanId ? await state.pendingScanPools.get(params.scanId) : null;
+    if (!pool) return { ok: false, error: "unknown scanId." };
+    if (fromPubkey !== transport.identity.hex && fromPubkey !== pool.requestedByPubkeyHex) return { ok: false, error: "forbidden - not your scan." };
+    return { ok: true, status: pool.status, scanType: pool.scanType, spawns: pool.spawns };
+  });
+
+  // Makes a scan's results public, for real, the normal way - replaying
+  // each stored spawn through the exact same "spawn.observed" event an
+  // organic sighting emits, rather than writing to state.spawns directly,
+  // is what's important here: it's the only path that runs
+  // PokemonStateService's own validateSpawn() check and its "already
+  // expired by the time this reaches state" skip (approval can happen
+  // several minutes after a spawn was collected - late enough for either
+  // to matter) before anything is published, exactly as if it had just now
+  // been observed for the first time. Only ever publishes what this worker
+  // itself already stored under this scanId - the request carries no spawn
+  // data of its own, so there is no way to inject anything here.
+  rpc.handle("approveScanResults", async (params, { fromPubkey }) => {
+    const pool = params?.scanId ? await state.pendingScanPools.get(params.scanId) : null;
+    if (!pool) return { ok: false, error: "unknown scanId." };
+    if (fromPubkey !== transport.identity.hex && fromPubkey !== pool.requestedByPubkeyHex) return { ok: false, error: "forbidden - not your scan." };
+    if (pool.status === "broadcast") return { ok: false, error: "already broadcast." };
+
+    // Anonymous-but-consistent attribution (see checkScanSubscription's own
+    // comment on attributionTag) plus which kind of scan this was -
+    // PROTOCOL.md documents both as additive, optional Spawn fields.
+    // displayNameOverride doesn't exist yet (a later feature lets the
+    // operator set one, with the subscriber's approval) - checking for it
+    // here now means approveScanResults won't need to change when that
+    // ships. Falls back to a fixed placeholder rather than failing the
+    // whole approve if the requester's own ledger row is somehow gone (e.g.
+    // manually removed by the operator between request and approval).
+    const requester = await state.scanSubscribers.get(pool.requestedByPubkeyHex);
+    const sharedByTag = requester?.displayNameOverride || requester?.attributionTag || "????";
+    const discoveredVia = pool.scanType === "species" ? "species-scan" : "area-scan";
+
+    for (const spawn of pool.spawns) bus.emit("spawn.observed", { ...spawn, discoveredVia, sharedByTag });
+    await state.pendingScanPools.put({ ...pool, status: "broadcast" });
+    return { ok: true, published: pool.spawns.length };
+  });
+
+  // Callable by anyone (no auth check at all - this is the discovery path,
+  // not an admin one): the viewer calls this to learn whether the visitor
+  // has an active "cusuco" subscription and how many scans they have left
+  // today, and in doing so, a never-seen pubkey gets a row created here
+  // with activeUntil: null - "known, but never granted access". This is
+  // deliberately the *only* way scanSubscribers rows come into existence
+  // other than the operator's own admin panel - it's what turns "every
+  // visitor who opens the map" into "a list of npubs the operator can
+  // choose to grant a subscription to", without requiring anyone to
+  // manually hand over their own npub out of band. Never grants anything
+  // itself - an auto-created row's activeUntil is always null, which reads
+  // as "not active" exactly like an admin-set one that's expired.
+  rpc.handle("checkScanSubscription", async (_params, { fromPubkey }) => {
+    const now = Date.now();
+    const existing = await state.scanSubscribers.get(fromPubkey);
+    // firstSeenAt is set once and never touched again; lastSeenAt and
+    // seenCount are bumped on every call, including an existing row's -
+    // this is what eventually lets a "showed up once and never came back"
+    // row be told apart from a repeat visitor (see the retention discussion
+    // this came out of - not yet acted on by anything, just recorded for
+    // now). seenCount is purely informational (an operator sanity check on
+    // how real/active a given npub is), nothing currently reads it.
+    // attributionTag (see approveScanResults) is computed once, right here,
+    // the first time this npub is ever encountered - never recomputed after
+    // that, so it stays stable across every scan this npub ever shares,
+    // even if the underlying CRC16 implementation's exact bytes-in were to
+    // change later. It's the CRC16 of the npub (bech32 form, not raw hex)
+    // per the operator's own spec: short, deterministic, and reveals
+    // nothing about the actual identity - a future feature will let the
+    // operator override it with a real display name (see
+    // scanSubscribers' own storage comment), which is why the resolution
+    // in approveScanResults checks for that override first rather than
+    // assuming this tag is always what gets shown.
+    const subscriber = existing
+      ? { ...existing, lastSeenAt: now, seenCount: (existing.seenCount ?? 1) + 1 }
+      : {
+          pubkeyHex: fromPubkey,
+          activeUntil: null,
+          note: "",
+          firstSeenAt: now,
+          lastSeenAt: now,
+          seenCount: 1,
+          attributionTag: crc16Tag(encodeNpub(fromPubkey)),
+        };
+    await state.scanSubscribers.put(subscriber);
+    const isActive = Boolean(subscriber.activeUntil) && new Date(subscriber.activeUntil).getTime() >= Date.now();
+    const today = todayKey();
+    const usedToday = subscriber.scansUsedDate === today ? (subscriber.scansUsedToday ?? 0) : 0;
+    return {
+      ok: true,
+      active: isActive,
+      activeUntil: subscriber.activeUntil,
+      cusucosRemaining: isActive ? Math.max(0, resolveSubscriberDailyLimit(subscriber) - usedToday) : 0,
+    };
+  });
+
+  // Admin-only (self-pubkey) view/edit of the scan-subscriber ledger - see
+  // worker/storage/indexeddb.js's own comment on scanSubscribers.
+  rpc.handle("listScanSubscribers", async (_params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    return { ok: true, subscribers: await state.scanSubscribers.all() };
+  });
+  rpc.handle("setScanSubscriber", async (params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    let pubkeyHex;
+    try {
+      pubkeyHex = decodeNpub(params?.npub);
+    } catch (err) {
+      return { ok: false, error: `invalid npub: ${err.message}` };
+    }
+    const activeUntil = String(params?.activeUntil ?? "").trim();
+    if (!activeUntil || Number.isNaN(new Date(activeUntil).getTime())) return { ok: false, error: "activeUntil must be a valid date." };
+    const note = typeof params?.note === "string" ? params.note : "";
+    const existing = await state.scanSubscribers.get(pubkeyHex);
+
+    // Per-subscriber override of scanDailyLimitPerSubscriber - see
+    // resolveSubscriberDailyLimit. Omitting the param entirely preserves
+    // whatever was already set; an explicit blank clears it back to "use
+    // the fleet-wide default" rather than being rejected as invalid.
+    let dailyLimit = existing?.dailyLimit ?? null;
+    if (params?.dailyLimit !== undefined) {
+      const raw = String(params.dailyLimit).trim();
+      if (raw === "") {
+        dailyLimit = null;
+      } else {
+        const parsed = Number(raw);
+        if (!Number.isInteger(parsed) || parsed < 1) return { ok: false, error: "dailyLimit must be a positive integer, or blank to use the default." };
+        dailyLimit = parsed;
+      }
+    }
+
+    // Preserves any existing quota-usage fields - this call only ever
+    // touches activeUntil/note/dailyLimit, never scansUsedToday/scansUsedDate.
+    await state.scanSubscribers.put({ ...existing, pubkeyHex, activeUntil, note, dailyLimit });
+    return { ok: true };
+  });
+  rpc.handle("removeScanSubscriber", async (params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    let pubkeyHex;
+    try {
+      pubkeyHex = decodeNpub(params?.npub);
+    } catch (err) {
+      return { ok: false, error: `invalid npub: ${err.message}` };
+    }
+    await state.scanSubscribers.delete(pubkeyHex);
+    return { ok: true };
   });
   rpc.start();
 
@@ -429,6 +685,30 @@ async function startWorker(publicConfig, secretConfig) {
     }
     input.value = "";
     await ahkConnector.sendCustomCommand(value);
+  });
+
+  document.getElementById("export-data").addEventListener("click", async () => {
+    const statusEl = document.getElementById("export-data-status");
+    statusEl.textContent = "Exporting…";
+    statusEl.hidden = false;
+    try {
+      const dump = await exportAllData();
+      const blob = new Blob([JSON.stringify(dump, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `cusucomap-worker-backup-${timestamp}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      statusEl.textContent = "Downloaded.";
+    } catch (err) {
+      logger.error("worker", `export failed: ${err.message}`);
+      statusEl.textContent = `Failed: ${err.message}`;
+    }
+    setTimeout(() => {
+      statusEl.hidden = true;
+    }, 3000);
   });
 
   document.getElementById("expire-field-research").addEventListener("click", async () => {

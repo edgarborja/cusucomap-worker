@@ -89,6 +89,26 @@
       </form>
       <p id="area-scan-error" class="error" hidden></p>
     </div>
+
+    <div class="panel">
+      <h2>Scan subscribers <span class="hint">("cusucos" - who can request a scan, and until when)</span></h2>
+      <p class="lede">
+        Only npubs listed here (with a not-yet-expired date) can request an area/species scan of their own. Each
+        gets a daily quota - 1 by default, or set "daily limit" per npub to grant more (or fewer). Adding an npub
+        already in the list updates its date/limit/note instead of duplicating it; leaving daily limit blank resets
+        it to the default, and it never resets that npub's quota usage for today.
+      </p>
+      <ul id="scan-subscribers-list" class="command-list"></ul>
+      <form id="add-scan-subscriber-form" class="command-row">
+        <input id="new-scan-subscriber-npub" type="text" placeholder="npub1..." />
+        <input id="new-scan-subscriber-until" type="date" />
+        <input id="new-scan-subscriber-limit" type="number" min="1" step="1" placeholder="daily limit (default)" />
+        <input id="new-scan-subscriber-note" type="text" placeholder="note (optional)" />
+        <button type="submit">Add / update</button>
+      </form>
+      <p id="scan-subscribers-status" hidden></p>
+      <p id="scan-subscribers-error" class="error" hidden></p>
+    </div>
   </section>
 </main>
 

@@ -118,6 +118,19 @@ export function defaultAhkConfig() {
     // param's own typed value rather than moving to the next field, but
     // http_send.ahk's TypeIt already sends a real {Tab} keypress for `\t`.
     defaultGeofilterCommand: "/pokeset geofilter radius:10km\tcenter:13.677440,-89.283353",
+    // How many area/species scans a single "cusuco" scan subscriber (see
+    // worker-app.js's runAreaScan and the commands page's "Scan subscribers"
+    // panel) can run per calendar day - shared across scan types, not one
+    // allowance per type. Has no effect on the operator's own (self-pubkey)
+    // scans, which are unlimited as today.
+    scanDailyLimitPerSubscriber: 1,
+    // The per-circle search radius for a subscriber-requested scan - fixed
+    // server-side, never something the caller supplies (see worker-app.js's
+    // runAreaScan). A string, not a number: embedded verbatim into the
+    // generated command text, same as the operator's own area-scan radius
+    // input already is. Has no effect on the operator's own (self-pubkey)
+    // scans, which still specify their own radius as today.
+    subscriberScanRadiusKmText: "0.06",
   };
 }
 

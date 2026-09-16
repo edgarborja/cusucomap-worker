@@ -148,6 +148,24 @@ export function isNoResultsAck(contentEl) {
   return NO_RESULTS_RE.test(contentEl.textContent.trim());
 }
 
+// A genuine platform-side failure (the bot never actually answered a
+// command), not a "nothing found" result - see isNoResultsAck above for
+// that case. These are a fixed, small set of generic system notices the
+// platform itself renders (an ephemeral, only-the-invoker-sees-it message,
+// confirmed via a real captured sample - see
+// sampledata/sample-feederror-*.html), not something the bot composes, so
+// there's no field structure to parse out - just detect-and-log by exact
+// displayed text. New variants get added here as they're captured; matching
+// only known, confirmed text (rather than a loose pattern) avoids ever
+// mistaking some future, differently-worded bot reply for a platform error.
+const KNOWN_APPLICATION_ERRORS = ["The application did not respond"];
+
+/** @returns {string|null} the matched error text, or null if this isn't one of the known ones. */
+export function detectApplicationError(contentEl) {
+  const text = contentEl.textContent.trim();
+  return KNOWN_APPLICATION_ERRORS.includes(text) ? text : null;
+}
+
 // A non-empty reply to a species search ("/questsearch <species>" or
 // similar) - one or more quest-shaped blocks, each followed by a Google
 // Maps link giving its *exact* coordinates, unlike a normal quest post.

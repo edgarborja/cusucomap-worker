@@ -80,6 +80,27 @@ class EntityStore {
     }
     return count;
   }
+
+  /**
+   * Actually deletes (not just status-flips - see sweepExpired above) every
+   * entity whose expiry passed more than `maxAgeMs` ago, regardless of its
+   * current status - a defensive floor rather than "only ever delete
+   * already-'expired' rows", in case sweepExpired somehow hasn't run yet for
+   * one. This is what keeps the database from growing forever (see
+   * PokemonStateService's own daily retention trim) - deleting the local
+   * row doesn't retroactively unpublish anything: whatever this entity's
+   * state was at expiry is already what every subscriber's own relay/viewer
+   * last saw, per PROTOCOL.md's "reconstruct from the newest event per d"
+   * model, so removing it here has no effect on anyone else.
+   * @returns {number} how many were deleted
+   */
+  async pruneOlderThan(maxAgeMs, now = new Date()) {
+    const all = await this.#collection.getAll();
+    const cutoff = now.getTime() - maxAgeMs;
+    const stale = all.filter((e) => new Date(e[this.#expiryField]).getTime() < cutoff);
+    await Promise.all(stale.map((e) => this.#collection.delete(e.id)));
+    return stale.length;
+  }
 }
 
 class UserStore {
@@ -124,6 +145,65 @@ class PushSubscriptionStore {
   }
   async byUser(userId) {
     return this.#collection.getAllByIndex("byUser", userId);
+  }
+}
+
+/**
+ * The "cusuco" scan-subscription ledger (see worker/storage/indexeddb.js's
+ * own comment on why this is its own store, never merged into
+ * PushSubscriptionStore). Rows: { pubkeyHex, activeUntil: ISOString, note?:
+ * string, scansUsedToday?: number, scansUsedDate?: "YYYY-MM-DD" }. Never
+ * auto-deletes anything - an operator's explicit `remove` (see
+ * worker-app.js's removeScanSubscriber) is the only way a row disappears.
+ */
+class ScanSubscriberStore {
+  #collection;
+  constructor(collection) {
+    this.#collection = collection;
+  }
+  async get(pubkeyHex) {
+    return this.#collection.get(pubkeyHex);
+  }
+  async put(subscriber) {
+    return this.#collection.put(subscriber);
+  }
+  async delete(pubkeyHex) {
+    return this.#collection.delete(pubkeyHex);
+  }
+  async all() {
+    return this.#collection.getAll();
+  }
+}
+
+/**
+ * Pending (not-yet-public) scan results - see worker-app.js's
+ * runAreaScan/getScanResults/approveScanResults and
+ * worker/storage/indexeddb.js's own comment. Rows: { scanId, scanType,
+ * requestedByPubkeyHex, createdAt, status: "collecting"|"pending"|
+ * "broadcast", spawns: object[] }.
+ */
+class PendingScanPoolStore {
+  #collection;
+  constructor(collection) {
+    this.#collection = collection;
+  }
+  async get(scanId) {
+    return this.#collection.get(scanId);
+  }
+  async put(pool) {
+    return this.#collection.put(pool);
+  }
+  async delete(scanId) {
+    return this.#collection.delete(scanId);
+  }
+  async all() {
+    return this.#collection.getAll();
+  }
+  /** Read-modify-write: appends one spawn to a still-collecting pool. No-op if the pool doesn't exist (e.g. it was somehow discarded mid-scan). */
+  async appendSpawn(scanId, spawn) {
+    const pool = await this.#collection.get(scanId);
+    if (!pool) return;
+    await this.#collection.put({ ...pool, spawns: [...pool.spawns, spawn] });
   }
 }
 
@@ -177,5 +257,7 @@ export function createApplicationState(bus) {
     pushSubscriptions: new PushSubscriptionStore(storage.pushSubscriptions),
     processedEvents: new ProcessedEventStore(storage.processedEvents),
     workerMetadata: new MetadataStore(storage.workerMetadata),
+    scanSubscribers: new ScanSubscriberStore(storage.scanSubscribers),
+    pendingScanPools: new PendingScanPoolStore(storage.pendingScanPools),
   };
 }

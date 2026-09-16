@@ -25,6 +25,11 @@ const COMMANDS_METADATA_KEY = "ahkCommandsConfig";
 // too - see the plan discussion this came out of).
 const DAILY_COMMAND_JITTER_MINUTES = 15;
 
+// The gap between typing a double-Enter command (see #sendDoubleEnter) and
+// pressing the Enter that confirms it - just long enough for Discord's own
+// UI to register the typed command, not a full inter-command settle pause.
+const CONFIRM_ENTER_GAP = { minS: 1, maxS: 2 };
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -259,9 +264,19 @@ export class AhkConnector {
    * Enter - see #sendChain's own comment for the incident that first
    * surfaced this, and watch-channel-connector.js's #handleAlert for the
    * same reasoning applied to a hotkey+sequence pair instead.
+   *
+   * The two sends get *different* pauses, not `pause` twice: the first only
+   * needs to be long enough for Discord's own UI to register the typed
+   * command (autocomplete, etc.) before the Enter keypress, not a full
+   * randomized inter-command settle pause - that only needs to happen once,
+   * after the Enter actually submits something, which is what `pause`
+   * itself is for. Using `pause` for both (an earlier version of this did)
+   * cost every double-Enter command an extra several-second delay for no
+   * real benefit - confirmed live: the command still worked either way,
+   * this only affects how long the whole thing takes.
    */
   #sendDoubleEnter(message, pause) {
-    const commandSend = this.#sendSerialized(message, pause);
+    const commandSend = this.#sendSerialized(message, CONFIRM_ENTER_GAP);
     const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
     return Promise.all([commandSend, enterSend]);
   }

@@ -5,7 +5,7 @@
 // could be swapped later without touching services/connectors.
 
 const DB_NAME = "cusucomap-worker";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 /** @type {Record<string, { keyPath: string, indexes?: [string, string, IDBIndexParameters?][] }>} */
 const STORE_DEFS = {
@@ -25,6 +25,48 @@ const STORE_DEFS = {
   // Single-row-per-key bag for small worker-wide facts (last snapshot
   // publish time, counters survived across reload, etc).
   workerMetadata: { keyPath: "key" },
+  // The operator-maintained ledger of who has an active "cusuco" scan
+  // subscription (see commands/commands-app.js's admin panel and
+  // worker-app.js's runAreaScan authorization) - deliberately its own store,
+  // not a field bolted onto pushSubscriptions above: that collection
+  // self-deletes rows under several conditions unrelated to payment (a
+  // stale/expired push endpoint, malformed key cleanup), and a paid
+  // subscriber's access must never be silently revoked by that unrelated
+  // cleanup. Rows here are never auto-deleted - an expired subscription
+  // just fails its activeUntil check, kept as a record rather than erased.
+  // A row's mere *existence* doesn't mean anything was ever granted:
+  // checkScanSubscription (worker-app.js) auto-creates one with
+  // activeUntil: null the first time any visitor's pubkey asks about its
+  // own subscription status - that's the discovery mechanism that turns
+  // "everyone who's opened the map" into a list the operator can grant
+  // access from, without anyone needing to hand over their npub separately.
+  // Every checkScanSubscription call also stamps lastSeenAt and increments
+  // seenCount (firstSeenAt is set once and never touched again) - not yet
+  // acted on by anything, but it's what a future cleanup could use to tell
+  // a one-time visitor from a repeat one before trimming rows that were
+  // never granted access. attributionTag (a CRC16 of the npub - see
+  // shared/crc16.js) is also computed once, at that same first-encounter
+  // moment, and never recomputed - it's what approveScanResults stamps
+  // onto shared spawns as an anonymous-but-consistent "who found this"
+  // marker (see PROTOCOL.md's Spawn content). displayNameOverride doesn't
+  // exist yet - a later feature will let the operator replace a
+  // subscriber's raw tag with a real name/alias, with that subscriber's
+  // approval; approveScanResults already prefers it over attributionTag
+  // when present, so adding it later needs no code change there.
+  // dailyLimit (null/absent = use scanDailyLimitPerSubscriber, the
+  // fleet-wide default in defaultAhkConfig()) lets the operator grant a
+  // specific subscriber more (or fewer) scans/day than everyone else -
+  // set via the commands page's admin panel, read by
+  // resolveSubscriberDailyLimit (worker-app.js), which both
+  // authorizeScanRequest and checkScanSubscription's own cusucosRemaining
+  // go through, so the two can never disagree on what the limit actually is.
+  scanSubscribers: { keyPath: "pubkeyHex" },
+  // A scan's private, not-yet-public results (see worker-app.js's
+  // runAreaScan/getScanResults/approveScanResults) - holds whatever spawns
+  // were observed while that scan held bulk-scan priority, until the
+  // requester either approves (publishes them for real, the normal way) or
+  // lets the pool expire once every spawn in it has despawned.
+  pendingScanPools: { keyPath: "scanId" },
 };
 
 function openDb() {
@@ -113,4 +155,23 @@ export function openStorage() {
     collections[name] = new Collection(dbPromise, name);
   }
   return collections;
+}
+
+/**
+ * Dumps every store's full contents, keyed by store name - for the
+ * dashboard's local "Export data" button (see worker/dashboard/dashboard.js).
+ * Generic over whatever's in STORE_DEFS, so a store added later is
+ * automatically included with no change here. Opens its own short-lived
+ * connection rather than reusing the app's long-lived one - this is a rare,
+ * one-off action, not something worth threading through the rest of the
+ * app's startup wiring.
+ * @returns {Promise<Record<string, unknown[]>>}
+ */
+export async function exportAllData() {
+  const collections = openStorage();
+  const dump = {};
+  for (const [name, collection] of Object.entries(collections)) {
+    dump[name] = await collection.getAll();
+  }
+  return dump;
 }

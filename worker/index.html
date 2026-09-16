@@ -92,7 +92,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-15 07:07 UTC</p>
+    <p id="build-date">Build: 2026-09-16 17:02 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -109,6 +109,15 @@
     <div class="panel">
       <h2>Activity log</h2>
       <ul id="activity-log"></ul>
+    </div>
+
+    <div class="panel">
+      <h2>Backup <span class="hint">(local download - never sent anywhere)</span></h2>
+      <p class="lede">Downloads a full snapshot of this worker's local database (spawns, raids, field research, subscribers, etc). Active spawns/raids/quests are trimmed automatically 2 hours after they expire, so this is the only way to keep older history if you want it.</p>
+      <p>
+        <button id="export-data" type="button">Export data</button>
+        <span id="export-data-status" hidden></span>
+      </p>
     </div>
 
     <div class="panel">

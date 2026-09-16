@@ -157,6 +157,7 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     pool = new NT.SimplePool({ enablePing: true, enableReconnect: true });
 
     const commands = await callSelf("getAhkCommands");
+    const subscribers = await callSelf("listScanSubscribers");
 
     if (document.getElementById("field-remember").checked) {
       localStorage.setItem(REMEMBER_KEY, JSON.stringify({ nsec, relaysText: document.getElementById("field-relays").value }));
@@ -168,6 +169,7 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     document.getElementById("worker-npub").hidden = false;
     renderScheduled(commands.scheduledSearches);
     renderDaily(commands.dailyCommands);
+    renderScanSubscribers(subscribers.subscribers);
     document.getElementById("connect-screen").hidden = true;
     document.getElementById("commands-screen").hidden = false;
   } catch (err) {
@@ -235,6 +237,154 @@ document.getElementById("area-scan-form").addEventListener("submit", async (even
   } catch (err) {
     statusEl.hidden = true;
     errorEl.textContent = `Failed to start: ${err.message}`;
+    errorEl.hidden = false;
+  }
+});
+
+// scansUsedToday/scansUsedDate are computed client-side against "today" for
+// display only - the worker itself is the actual source of truth for
+// whether a given request is still within quota (see worker-app.js's
+// authorizeScanRequest), this is just so the operator doesn't have to
+// mentally recompute a stale-looking count.
+function scanSubscriberUsageText(sub) {
+  const today = new Date().toISOString().slice(0, 10);
+  const usedToday = sub.scansUsedDate === today ? (sub.scansUsedToday ?? 0) : 0;
+  const seenCount = sub.seenCount ?? 1;
+  const limitText = sub.dailyLimit ? String(sub.dailyLimit) : "default";
+  return `used today: ${usedToday}/${limitText} · seen ${seenCount}x`;
+}
+
+// A row's mere existence doesn't mean anything was ever granted - see
+// worker/storage/indexeddb.js's own comment on checkScanSubscription's
+// auto-discovery. Distinguishing the three states here (rather than just
+// showing the raw date) is what makes "all known npubs" actually readable
+// as a list to grant access from, per the original ask.
+function scanSubscriberStatusLabel(sub) {
+  if (!sub.activeUntil) return "not granted";
+  return new Date(sub.activeUntil).getTime() >= Date.now() ? "active" : "expired";
+}
+
+function makeScanSubscriberRow(sub) {
+  const li = document.createElement("li");
+  li.className = "command-row";
+  const npub = nostrTools().nip19.npubEncode(sub.pubkeyHex);
+
+  const npubEl = document.createElement("span");
+  npubEl.className = "command-text";
+  npubEl.textContent = `${npub.slice(0, 16)}…`;
+  npubEl.title = npub;
+
+  const statusEl = document.createElement("span");
+  statusEl.className = "hint";
+  statusEl.textContent = scanSubscriberStatusLabel(sub);
+
+  const untilEl = document.createElement("input");
+  untilEl.type = "date";
+  untilEl.value = (sub.activeUntil || "").slice(0, 10);
+  untilEl.addEventListener("input", () => {
+    statusEl.textContent = scanSubscriberStatusLabel({ activeUntil: untilEl.value });
+  });
+
+  const limitEl = document.createElement("input");
+  limitEl.type = "number";
+  limitEl.min = "1";
+  limitEl.step = "1";
+  limitEl.placeholder = "daily limit (default)";
+  limitEl.value = sub.dailyLimit ?? "";
+
+  const noteEl = document.createElement("input");
+  noteEl.type = "text";
+  noteEl.placeholder = "note";
+  noteEl.value = sub.note || "";
+
+  const usedEl = document.createElement("span");
+  usedEl.className = "hint";
+  usedEl.textContent = scanSubscriberUsageText(sub);
+
+  function reportError(err) {
+    const errorEl = document.getElementById("scan-subscribers-error");
+    errorEl.textContent = `Failed: ${err.message}`;
+    errorEl.hidden = false;
+  }
+  function reportSaved() {
+    const statusEl = document.getElementById("scan-subscribers-status");
+    statusEl.textContent = "Saved.";
+    statusEl.hidden = false;
+    setTimeout(() => {
+      statusEl.hidden = true;
+    }, 3000);
+  }
+
+  const saveBtn = button("Save", async () => {
+    document.getElementById("scan-subscribers-error").hidden = true;
+    try {
+      // limitEl.value is "" when the operator left/cleared it - that's
+      // sent through as-is, which setScanSubscriber treats as "reset to
+      // the fleet-wide default", not an error.
+      await callSelf("setScanSubscriber", { npub, activeUntil: untilEl.value, note: noteEl.value, dailyLimit: limitEl.value });
+      reportSaved();
+    } catch (err) {
+      reportError(err);
+    }
+  });
+  const removeBtn = button("✕", async () => {
+    document.getElementById("scan-subscribers-error").hidden = true;
+    try {
+      await callSelf("removeScanSubscriber", { npub });
+      li.remove();
+    } catch (err) {
+      reportError(err);
+    }
+  });
+
+  li.append(npubEl, statusEl, untilEl, limitEl, noteEl, usedEl, saveBtn, removeBtn);
+  return li;
+}
+
+function renderScanSubscribers(subscribers) {
+  const list = document.getElementById("scan-subscribers-list");
+  list.innerHTML = "";
+  for (const sub of subscribers) list.append(makeScanSubscriberRow(sub));
+}
+
+document.getElementById("add-scan-subscriber-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const errorEl = document.getElementById("scan-subscribers-error");
+  errorEl.hidden = true;
+
+  const npubInput = document.getElementById("new-scan-subscriber-npub");
+  const untilInput = document.getElementById("new-scan-subscriber-until");
+  const limitInput = document.getElementById("new-scan-subscriber-limit");
+  const noteInput = document.getElementById("new-scan-subscriber-note");
+  const npub = npubInput.value.trim();
+  const activeUntil = untilInput.value;
+  const dailyLimit = limitInput.value;
+  const note = noteInput.value.trim();
+  if (!npub || !activeUntil) {
+    errorEl.textContent = "npub and active-until date are required.";
+    errorEl.hidden = false;
+    return;
+  }
+
+  try {
+    await callSelf("setScanSubscriber", { npub, activeUntil, dailyLimit, note });
+    // Re-render from the worker's own confirmed list, not just this one
+    // addition - catches both a genuinely new row and an update to an
+    // existing one (same npub) without needing to tell those apart here.
+    const subscribers = await callSelf("listScanSubscribers");
+    renderScanSubscribers(subscribers.subscribers);
+    npubInput.value = "";
+    untilInput.value = "";
+    limitInput.value = "";
+    noteInput.value = "";
+    const statusEl = document.getElementById("scan-subscribers-status");
+    statusEl.textContent = "Saved.";
+    statusEl.hidden = false;
+    setTimeout(() => {
+      statusEl.hidden = true;
+    }, 3000);
+  } catch (err) {
+    errorEl.textContent = `Failed: ${err.message}`;
     errorEl.hidden = false;
   }
 });

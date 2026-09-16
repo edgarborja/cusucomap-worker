@@ -10,7 +10,7 @@
 // raid search results -> pokesearch results -> plain quest -> plain raid)
 // matters - a search-result reply's :pokestop: emoji can otherwise
 // false-match the plain quest detector, etc.
-import { parseQuestMessage, parseRaidMessage, parseSearchResultMessage, isNoResultsAck } from "../../userscript/fieldresearch-parser.js";
+import { parseQuestMessage, parseRaidMessage, parseSearchResultMessage, isNoResultsAck, detectApplicationError } from "../../userscript/fieldresearch-parser.js";
 import { parsePokesearchReply, parseRaidSearchReply, ownMessageContentEl } from "../../shared/source-feed-pokemon-search-parser.js";
 import { resolvePoi } from "../../shared/poi-resolver.js";
 import { resolveSpecies, resolveItemSprite, FALLBACK_SPRITE_URL } from "../../shared/species-resolver.js";
@@ -26,6 +26,7 @@ export class SourceFeedConnector {
   #state;
   #getGeofilterAnchor;
   #getTrackedChannelIds;
+  #getActiveScanId;
   #seenMessageIds = new Set();
   #speciesCache;
 
@@ -34,13 +35,15 @@ export class SourceFeedConnector {
    *   configured disambiguation center, used only when a quest/raid name
    *   matches more than one bundled POI and no exact coordinates came with it.
    * @param {() => string[]} getTrackedChannelIds - Source Feed channel ids the bridge should scrape; pushed to it on start() and whenever a Source Feed tab (re)connects, since the bridge script itself has no hardcoded channel to fall back on.
+   * @param {() => string|null} getActiveScanId - lazy accessor set (by worker-app.js's runAreaScan handler) for the duration of a subscriber-requested scan's own bulk-scan-priority window; null the rest of the time. While set, a parsed spawn is appended to that scan's private pending pool instead of becoming normal authoritative state - see #emitSpawn.
    */
-  constructor({ bus, logger, state, getGeofilterAnchor, getTrackedChannelIds }) {
+  constructor({ bus, logger, state, getGeofilterAnchor, getTrackedChannelIds, getActiveScanId }) {
     this.#bus = bus;
     this.#logger = logger;
     this.#state = state;
     this.#getGeofilterAnchor = getGeofilterAnchor;
     this.#getTrackedChannelIds = getTrackedChannelIds;
+    this.#getActiveScanId = getActiveScanId;
     this.#speciesCache = {
       get: (key) => this.#state.workerMetadata.get(`speciesResolverCache:${key}`, null),
       set: (key, value) => this.#state.workerMetadata.set(`speciesResolverCache:${key}`, value),
@@ -106,8 +109,27 @@ export class SourceFeedConnector {
 
     const ids = { channelId, messageId };
 
+    const applicationError = detectApplicationError(contentEl);
+    if (applicationError) {
+      // A real failure, not a "nothing here" result (see the isNoResultsAck
+      // branch below) - whatever command this replied to got no actual
+      // response, which the caller (a scheduled search, a daily command, an
+      // area scan) has no other way to notice. Warn rather than info so it
+      // stands out from routine activity in the log.
+      this.#markSeen(messageId);
+      this.#logger.warn("source-feed", `bot error: "${applicationError}"`);
+      return;
+    }
+
     if (isNoResultsAck(contentEl)) {
       this.#markSeen(messageId);
+      // Otherwise indistinguishable from a message that just hasn't
+      // finished rendering yet (see the unmarked fallthrough at the bottom
+      // of this method) - a real "nothing here" reply is a normal, expected
+      // outcome, not a problem, but it's still worth a line so an operator
+      // scanning the activity log (e.g. after an area scan) can tell a
+      // search genuinely came back empty rather than silently failing.
+      this.#logger.info("source-feed", `no results: "${contentEl.textContent.trim()}"`);
       return;
     }
 
@@ -246,7 +268,7 @@ export class SourceFeedConnector {
     const despawnAt = new Date(snowflakeToMs(ids.messageId) + spawn.despawnInMinutes * 60000).toISOString();
     const location = { lat: spawn.exactCoords.lat, lon: spawn.exactCoords.lon };
 
-    this.#bus.emit("spawn.observed", {
+    const normalized = {
       id,
       channelId: 0,
       source: "source-feed", // wire-protocol value (see PROTOCOL.md) - not renamed, the viewer expects this exact string
@@ -275,6 +297,21 @@ export class SourceFeedConnector {
       spriteUrl: sprite ? sprite.spriteUrl : FALLBACK_SPRITE_URL,
       types: sprite ? sprite.types : [],
       unevolved: false,
-    });
+    };
+
+    // While a subscriber-requested scan holds bulk-scan priority (see
+    // worker-app.js's runAreaScan), everything it turns up goes into that
+    // scan's own private pending pool instead of becoming normal
+    // authoritative state - it never reaches PokemonStateService, so it
+    // doesn't appear on this worker's own map/dashboard or trigger
+    // notifications, until the requester explicitly approves it (see
+    // approveScanResults). The operator's own (self) scans are unaffected -
+    // getActiveScanId() is only ever set for a non-self requester.
+    const activeScanId = this.#getActiveScanId();
+    if (activeScanId) {
+      await this.#state.pendingScanPools.appendSpawn(activeScanId, normalized);
+      return;
+    }
+    this.#bus.emit("spawn.observed", normalized);
   }
 }
