@@ -124,13 +124,14 @@ export function defaultAhkConfig() {
     // allowance per type. Has no effect on the operator's own (self-pubkey)
     // scans, which are unlimited as today.
     scanDailyLimitPerSubscriber: 1,
-    // The per-circle search radius for a subscriber-requested scan - fixed
-    // server-side, never something the caller supplies (see worker-app.js's
-    // runAreaScan). A string, not a number: embedded verbatim into the
-    // generated command text, same as the operator's own area-scan radius
-    // input already is. Has no effect on the operator's own (self-pubkey)
-    // scans, which still specify their own radius as today.
-    subscriberScanRadiusKmText: "0.06",
+    // The geofilter radius for a subscriber-requested area scan's one
+    // point - fixed server-side, never something the caller supplies (see
+    // worker-app.js's runAreaScan and area-scan.js's
+    // buildSubscriberAreaScanCommands). A string, not a number: embedded
+    // verbatim into the generated command text. Has no effect on the
+    // operator's own (self-pubkey) scans, which still use the full
+    // hex-lattice/rings design with their own radius as today.
+    subscriberScanRadiusKmText: "0.1",
   };
 }
 

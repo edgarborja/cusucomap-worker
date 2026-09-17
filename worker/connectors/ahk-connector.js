@@ -381,11 +381,6 @@ export class AhkConnector {
     return this.#bulkScanActive;
   }
 
-  /** For a multi-step scan (see worker-app.js's runSpeciesScan) that sends its own commands one at a time instead of through runBulkScan's loop - that loop already checks this itself between sends. */
-  isRunning() {
-    return this.#running;
-  }
-
   /** No-op if no scan is currently running. Checked between commands, not mid-send - see runBulkScan. */
   cancelBulkScan() {
     if (this.#bulkScanActive) this.#bulkScanCancelRequested = true;
@@ -413,53 +408,6 @@ export class AhkConnector {
    * @returns {Promise<{sent: number, total: number, cancelled: boolean}>}
    */
   async runBulkScan(locations, buildRowCommands, onProgress, { beforeCommand, afterCommand } = {}) {
-    return this.withBulkScanPriority(async () => {
-      const { searchPauseMinS, searchPauseMaxS } = this.#getConfig();
-      const pause = { minS: searchPauseMinS, maxS: searchPauseMaxS };
-      const total = locations.reduce((sum, location) => sum + buildRowCommands(location).length, 0);
-      let sent = 0;
-      let cancelled = false;
-      try {
-        if (beforeCommand) await this.#sendDoubleEnter(beforeCommand, pause);
-        scanLoop: for (const location of locations) {
-          for (const message of buildRowCommands(location)) {
-            if (!this.#running || this.#bulkScanCancelRequested) {
-              cancelled = true;
-              break scanLoop;
-            }
-            await this.#sendSerialized(message, pause);
-            sent++;
-            onProgress?.(sent, total);
-          }
-        }
-      } finally {
-        if (afterCommand) {
-          try {
-            await this.#sendSerialized(afterCommand, pause);
-          } catch (err) {
-            this.#logger.error("ahk", `bulk scan cleanup command failed: ${err.message}`);
-          }
-        }
-      }
-      return { sent, total, cancelled };
-    });
-  }
-
-  /**
-   * Claims exclusive bulk-scan priority (the same mutex/gate runBulkScan
-   * itself uses - see that method's own doc comment for exactly what it
-   * blocks and why) for the duration of `fn`, then releases it - extracted
-   * so a caller with a more elaborate multi-step flow than "send a fixed
-   * list of location commands" doesn't have to reimplement the mutex
-   * itself. See worker-app.js's runSpeciesScan: it needs to send one
-   * command, inspect how many results it got, then decide whether to send
-   * more - a shape runBulkScan's own "iterate a fixed list" design doesn't
-   * fit, but the priority guarantee still needs to be identical.
-   * @template T
-   * @param {() => Promise<T>} fn
-   * @returns {Promise<T>}
-   */
-  async withBulkScanPriority(fn) {
     if (this.#bulkScanActive) throw new Error("A scan is already running.");
     this.#bulkScanActive = true;
     this.#bulkScanCancelRequested = false;
@@ -467,13 +415,38 @@ export class AhkConnector {
     this.#bulkScanGate = new Promise((resolve) => {
       releaseGate = resolve;
     });
+
+    const { searchPauseMinS, searchPauseMaxS } = this.#getConfig();
+    const pause = { minS: searchPauseMinS, maxS: searchPauseMaxS };
+    const total = locations.reduce((sum, location) => sum + buildRowCommands(location).length, 0);
+    let sent = 0;
+    let cancelled = false;
     try {
-      return await fn();
+      if (beforeCommand) await this.#sendDoubleEnter(beforeCommand, pause);
+      scanLoop: for (const location of locations) {
+        for (const message of buildRowCommands(location)) {
+          if (!this.#running || this.#bulkScanCancelRequested) {
+            cancelled = true;
+            break scanLoop;
+          }
+          await this.#sendSerialized(message, pause);
+          sent++;
+          onProgress?.(sent, total);
+        }
+      }
     } finally {
+      if (afterCommand) {
+        try {
+          await this.#sendSerialized(afterCommand, pause);
+        } catch (err) {
+          this.#logger.error("ahk", `bulk scan cleanup command failed: ${err.message}`);
+        }
+      }
       this.#bulkScanActive = false;
       this.#bulkScanCancelRequested = false;
       releaseGate();
       this.#bulkScanGate = Promise.resolve();
     }
+    return { sent, total, cancelled };
   }
 }

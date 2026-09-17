@@ -1,9 +1,17 @@
 // Command-building and validation for a species scan (see worker-app.js's
-// runSpeciesScan) - the sibling to worker/core/area-scan.js's location-based
-// lattice, but for "find this one species anywhere on the map" instead.
-// Unlike an area scan, there's no location/radius/rings to compute here -
-// just a plain species-number search, plus a fixed follow-up set used only
-// when that alone hits the search command's own per-query result cap.
+// runSpeciesScan) - "find this one species anywhere on the map", a single
+// /pokesearch by dex number and nothing else. An earlier version followed
+// up with extra narrower queries when the base one hit the search
+// command's own per-query result cap (see the
+// "project_scan_feature_v1_hexlattice" memory) - that's gone now: hitting
+// the cap just means the rest aren't found this time, and the worker
+// returns to the normal schedule after the one search.
+//
+// The operator's own (self) species scans run this command as-is, in
+// their own normal browser tab. A subscriber's scan wraps the exact same
+// command to instead run in the dedicated second tab (see area-scan.js's
+// wrapForSubscriberScanTab) - the command text itself never changes.
+import { wrapForSubscriberScanTab } from "./area-scan.js";
 
 // National pokedex numbers only go into the low thousands today, but this
 // deliberately leaves headroom rather than hardcoding today's exact max -
@@ -21,24 +29,7 @@ export function buildSpeciesScanCommand(dexNumber) {
   return `/pokesearch ${dexNumber}`;
 }
 
-// Minimum-IV/level/remaining-time bands, no maximums - each one alone can
-// still hit the same per-query cap the base search does, but together they
-// surface a broader mix of a common species than the one capped base query
-// would on its own. Fixed set, not configurable - see the plan discussion
-// this came out of for why these particular seven.
 /** @param {number} dexNumber - already validated via isValidDexNumber. */
-export function buildExtendedSpeciesScanCommands(dexNumber) {
-  return [
-    `/pokesearch ${dexNumber} iv66`,
-    `/pokesearch ${dexNumber} iv33`,
-    `/pokesearch ${dexNumber} iv0`,
-    `/pokesearch ${dexNumber} lvl20`,
-    `/pokesearch ${dexNumber} lvl10`,
-    `/pokesearch ${dexNumber} lvl1`,
-    `/pokesearch ${dexNumber} 20m`,
-  ];
+export function buildSubscriberSpeciesScanCommand(dexNumber) {
+  return wrapForSubscriberScanTab(buildSpeciesScanCommand(dexNumber));
 }
-
-// Only the base query's own result count decides whether the extended
-// queries run at all - see worker-app.js's runSpeciesScan.
-export const EXTENDED_SCAN_TRIGGER_COUNT = 12;

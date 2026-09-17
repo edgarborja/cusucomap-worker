@@ -19,8 +19,8 @@ import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
 import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
-import { generateHexLattice, buildAreaScanCommand } from "./core/area-scan.js";
-import { isValidDexNumber, buildSpeciesScanCommand, buildExtendedSpeciesScanCommands, EXTENDED_SCAN_TRIGGER_COUNT } from "./core/species-scan.js";
+import { generateHexLattice, buildAreaScanCommand, buildSubscriberAreaScanCommand } from "./core/area-scan.js";
+import { isValidDexNumber, buildSpeciesScanCommand, buildSubscriberSpeciesScanCommand } from "./core/species-scan.js";
 import { exportAllData } from "./storage/indexeddb.js";
 import { crc16Tag } from "../shared/crc16.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
@@ -456,18 +456,33 @@ async function startWorker(publicConfig, secretConfig) {
     if (!auth.ok) return auth;
 
     const { subscriberScanRadiusKmText, areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
-    // A subscriber never controls the per-circle radius or ring count -
-    // both fixed server-side regardless of what's sent, not just a
-    // client-side limit, since a self-crafted request could otherwise ask
-    // for anything. Only the operator's own (self) scans may set their own
-    // radius and use the full 1-5 ring range.
-    const radiusKmText = auth.isSelf ? String(params?.radiusKmText ?? "").trim() : subscriberScanRadiusKmText;
-    const radiusKm = Number(radiusKmText);
-    const rings = auth.isSelf ? Number(params?.rings) : 1;
-    if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return rejectScanRequest(fromPubkey, "runAreaScan", "radiusKmText must be a positive number.");
-    if (!Number.isInteger(rings) || rings < 1 || rings > 5) return rejectScanRequest(fromPubkey, "runAreaScan", "rings must be an integer between 1 and 5.");
-
-    const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
+    // Two entirely different scan shapes past this point - see
+    // area-scan.js's own doc comment for why. The operator's own
+    // commands-page scans (self) keep the full hex-lattice/rings design,
+    // specifying their own radius, run in their own normal browser tab; a
+    // subscriber's scan is always a single point at a fixed radius, run as
+    // one switch-tab/search/switch-back sequence in the dedicated second
+    // tab instead of many self-contained circle commands.
+    let total;
+    let runScan;
+    if (auth.isSelf) {
+      const radiusKmText = String(params?.radiusKmText ?? "").trim();
+      const radiusKm = Number(radiusKmText);
+      const rings = Number(params?.rings);
+      if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return rejectScanRequest(fromPubkey, "runAreaScan", "radiusKmText must be a positive number.");
+      if (!Number.isInteger(rings) || rings < 1 || rings > 5) return rejectScanRequest(fromPubkey, "runAreaScan", "rings must be an integer between 1 and 5.");
+      const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
+      total = points.length;
+      runScan = () =>
+        ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
+          beforeCommand: areaScanClearGeofilterCommand,
+          afterCommand: defaultGeofilterCommand,
+        });
+    } else {
+      const point = { lat: centerLat, lon: centerLon };
+      total = 1;
+      runScan = () => ahkConnector.runBulkScan([point], (p) => [buildSubscriberAreaScanCommand({ ...p, radiusKmText: subscriberScanRadiusKmText })]);
+    }
 
     const scanId = auth.isSelf ? null : crypto.randomUUID();
     if (scanId) {
@@ -496,12 +511,7 @@ async function startWorker(publicConfig, secretConfig) {
 
     // Deliberately not awaited - see this handler's own doc comment above.
     ahkControls
-      .enableThenRun(() =>
-        ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
-          beforeCommand: areaScanClearGeofilterCommand,
-          afterCommand: defaultGeofilterCommand,
-        })
-      )
+      .enableThenRun(runScan)
       .then(async (result) => {
         logger.info(
           "ahk",
@@ -523,17 +533,20 @@ async function startWorker(publicConfig, secretConfig) {
     // plus `scanId` is a complete, unambiguous structured signal on its own.
     logger.info(
       "worker",
-      `area scan request from ${fromPubkey.slice(0, 8)}… accepted (${auth.isSelf ? "operator" : "subscriber, cusuco charged"}) - ack sent (scanId=${scanId ?? "n/a"}, ${points.length} commands)`
+      `area scan request from ${fromPubkey.slice(0, 8)}… accepted (${auth.isSelf ? "operator" : "subscriber, cusuco charged"}) - ack sent (scanId=${scanId ?? "n/a"}, ${total} commands)`
     );
-    return { ok: true, total: points.length, scanId };
+    return { ok: true, total, scanId };
   });
 
   // Same authorization/ack/pool wiring as runAreaScan (see that handler's
   // own comments for the reasoning behind each piece, not repeated here).
-  // The one genuinely new mechanic: whether to send the 7 extended queries
-  // depends on how many results the base query alone got, a conditional
-  // step runBulkScan's own "iterate a fixed list" shape doesn't fit - see
-  // AhkConnector#withBulkScanPriority, extracted for exactly this.
+  // Just one command, always - no follow-up queries even if the base
+  // search hits its own per-query result cap (see the
+  // "project_scan_feature_v1_hexlattice" memory for the earlier,
+  // conditional-follow-up design this replaced). The command text itself
+  // never changes - only whether it runs in the operator's own normal tab
+  // (self) or the dedicated second tab (subscriber), same split as
+  // runAreaScan.
   rpc.handle("runSpeciesScan", async (params, { fromPubkey }) => {
     const dexNumber = Number(params?.dexNumber);
     if (!isValidDexNumber(dexNumber)) return rejectScanRequest(fromPubkey, "runSpeciesScan", "dexNumber must be a positive integer below 4096.");
@@ -558,39 +571,13 @@ async function startWorker(publicConfig, secretConfig) {
       await state.pendingScanPools.markCollectingAsPending(scanId);
     }
 
+    const command = auth.isSelf ? buildSpeciesScanCommand(dexNumber) : buildSubscriberSpeciesScanCommand(dexNumber);
+
     // Deliberately not awaited - see runAreaScan's own doc comment.
     ahkControls
-      .enableThenRun(() =>
-        ahkConnector.withBulkScanPriority(async () => {
-          // Counts only the base query's own results, to decide whether
-          // the extended queries are needed. A subscriber's results land
-          // in the pool above (state.pendingScanPools.appendSpawn), so its
-          // own spawns.length is the count; self's results publish
-          // immediately via the normal spawn.observed event instead (no
-          // pool at all, same as an area scan's self path), so counting
-          // needs a temporary listener on that event instead - the actual
-          // spawn parsing/normalization is identical either way, this is
-          // purely a bookkeeping difference for a decision area scan never
-          // needed to make at all.
-          let selfBaseCount = 0;
-          const unsubscribeSelfCounter = auth.isSelf ? bus.on("spawn.observed", () => selfBaseCount++) : null;
-          try {
-            await ahkConnector.sendCustomCommand(buildSpeciesScanCommand(dexNumber));
-          } finally {
-            unsubscribeSelfCounter?.();
-          }
-
-          const baseCount = scanId ? ((await state.pendingScanPools.get(scanId))?.spawns.length ?? 0) : selfBaseCount;
-          if (baseCount >= EXTENDED_SCAN_TRIGGER_COUNT) {
-            for (const command of buildExtendedSpeciesScanCommands(dexNumber)) {
-              if (!ahkConnector.isRunning()) break;
-              await ahkConnector.sendCustomCommand(command);
-            }
-          }
-        })
-      )
-      .then(async () => {
-        logger.info("ahk", `species scan done for dex #${dexNumber}`);
+      .enableThenRun(() => ahkConnector.runBulkScan([dexNumber], () => [command]))
+      .then(async (result) => {
+        logger.info("ahk", result.cancelled ? "species scan cancelled" : `species scan done for dex #${dexNumber}`);
         await finishPool();
       })
       .catch(async (err) => {
