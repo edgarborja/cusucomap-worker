@@ -37,6 +37,14 @@ const SPECIES_SLUG_OVERRIDES = { giratina: "giratina-altered" };
 // normally, then swap in the form-specific sprite filename.
 const UNOWN_FORM_RE = /^unown-([a-z])$/;
 
+async function fetchSpeciesBySlug(slug, unownLetter) {
+  const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const spriteId = unownLetter ? `${data.id}-${unownLetter}` : String(data.id);
+  return { spriteUrl: `${SPRITE_BASE}${spriteId}.png`, types: (data.types ?? []).map((t) => t.type.name) };
+}
+
 const memoryCache = new Map();
 /** No-op-persistent default cache; pass a `{get,set}` backed by ApplicationState.workerMetadata for real persistence (see worker/connectors/source-feed-connector.js). */
 const defaultCache = {
@@ -62,17 +70,35 @@ export async function resolveSpecies(speciesRaw, cache = defaultCache) {
   const unownLetter = key.match(UNOWN_FORM_RE)?.[1];
   const slug = SPECIES_SLUG_OVERRIDES[key] || (unownLetter ? "unown" : key);
   try {
-    const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const spriteId = unownLetter ? `${data.id}-${unownLetter}` : String(data.id);
-    const result = { spriteUrl: `${SPRITE_BASE}${spriteId}.png`, types: (data.types ?? []).map((t) => t.type.name) };
+    const result = await fetchSpeciesBySlug(slug, unownLetter);
     await cache.set(`species:${key}`, result);
     return result;
   } catch (err) {
     console.warn(`[species-resolver] could not resolve "${speciesRaw}" (slug "${slug}"):`, err.message);
-    return null;
   }
+
+  // A special/event form's display name (e.g. "Charmander (Goggles 2026)",
+  // "Pikachu (Horizons)") usually isn't its own PokeAPI entry - only the
+  // base species is. Retry with just the part before the first hyphen of
+  // the normalized slug ("charmander", "pikachu") rather than showing no
+  // sprite/types at all for what's still recognizably that species. Not
+  // attempted for Unown (already handled above as its own special case) or
+  // a slug with no hyphen to strip. Checks SPECIES_SEED first (cheap, no
+  // network) before falling back to another PokeAPI fetch.
+  if (unownLetter || !slug.includes("-")) return null;
+  const baseKey = slug.split("-")[0];
+  const baseSeeded = SPECIES_SEED[baseKey];
+  const fallback = baseSeeded
+    ? { spriteUrl: `${SPRITE_BASE}${baseSeeded[0]}.png`, types: baseSeeded[1] }
+    : await fetchSpeciesBySlug(baseKey, null).catch((err) => {
+        console.warn(`[species-resolver] base species fallback "${baseKey}" also failed for "${speciesRaw}":`, err.message);
+        return null;
+      });
+  if (fallback) {
+    console.warn(`[species-resolver] resolved "${speciesRaw}" via base species fallback "${baseKey}"`);
+    await cache.set(`species:${key}`, fallback);
+  }
+  return fallback;
 }
 
 // PokeAPI's item slug for a Poke Ball is hyphenated; the in-game name isn't.
