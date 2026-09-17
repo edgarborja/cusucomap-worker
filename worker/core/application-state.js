@@ -207,7 +207,13 @@ class PendingScanPoolStore {
   }
   /**
    * Read-modify-write: appends one spawn to a still-collecting pool. No-op
-   * if the pool doesn't exist (e.g. it was somehow discarded mid-scan).
+   * if the pool doesn't exist (e.g. it was somehow discarded mid-scan), and
+   * a no-op (not a duplicate entry) if this exact spawn (same deterministic
+   * id) is already in the pool - an area scan's deliberately-overlapping
+   * circles can both turn up the same real spawn, and a species scan's
+   * extended queries (min-IV/level/time bands, no maximums) overlap even
+   * more heavily by design, so the same real Pokémon routinely gets
+   * observed more than once in a single scan.
    *
    * MUST be serialized, not called as independent get-then-put pairs: a
    * single multi-pokemon message calls this once per record, all at once,
@@ -224,6 +230,7 @@ class PendingScanPoolStore {
     this.#appendChain = this.#appendChain.then(async () => {
       const pool = await this.#collection.get(scanId);
       if (!pool) return;
+      if (pool.spawns.some((s) => s.id === spawn.id)) return;
       await this.#collection.put({ ...pool, spawns: [...pool.spawns, spawn] });
     });
     return this.#appendChain;

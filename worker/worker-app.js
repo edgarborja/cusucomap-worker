@@ -20,6 +20,7 @@ import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
 import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
 import { generateHexLattice, buildAreaScanCommand } from "./core/area-scan.js";
+import { isValidDexNumber, buildSpeciesScanCommand, buildExtendedSpeciesScanCommands, EXTENDED_SCAN_TRIGGER_COUNT } from "./core/species-scan.js";
 import { exportAllData } from "./storage/indexeddb.js";
 import { crc16Tag } from "../shared/crc16.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
@@ -512,6 +513,83 @@ async function startWorker(publicConfig, secretConfig) {
       `area scan request from ${fromPubkey.slice(0, 8)}… accepted (${auth.isSelf ? "operator" : "subscriber, cusuco charged"}) - ack sent (scanId=${scanId ?? "n/a"}, ${points.length} commands)`
     );
     return { ok: true, total: points.length, scanId };
+  });
+
+  // Same authorization/ack/pool wiring as runAreaScan (see that handler's
+  // own comments for the reasoning behind each piece, not repeated here).
+  // The one genuinely new mechanic: whether to send the 7 extended queries
+  // depends on how many results the base query alone got, a conditional
+  // step runBulkScan's own "iterate a fixed list" shape doesn't fit - see
+  // AhkConnector#withBulkScanPriority, extracted for exactly this.
+  rpc.handle("runSpeciesScan", async (params, { fromPubkey }) => {
+    const dexNumber = Number(params?.dexNumber);
+    if (!isValidDexNumber(dexNumber)) return { ok: false, error: "dexNumber must be a positive integer below 4096." };
+    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
+
+    const auth = await authorizeScanRequest(fromPubkey);
+    if (!auth.ok) return { ok: false, error: auth.error };
+
+    const scanId = auth.isSelf ? null : crypto.randomUUID();
+    if (scanId) {
+      activeScanId = scanId;
+      // Not awaited - see runAreaScan's identical "no await gap before
+      // enableThenRun" reasoning.
+      state.pendingScanPools
+        .put({ scanId, scanType: "species", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
+        .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
+    }
+
+    async function finishPool() {
+      if (!scanId) return;
+      activeScanId = null;
+      await state.pendingScanPools.markCollectingAsPending(scanId);
+    }
+
+    // Deliberately not awaited - see runAreaScan's own doc comment.
+    ahkControls
+      .enableThenRun(() =>
+        ahkConnector.withBulkScanPriority(async () => {
+          // Counts only the base query's own results, to decide whether
+          // the extended queries are needed. A subscriber's results land
+          // in the pool above (state.pendingScanPools.appendSpawn), so its
+          // own spawns.length is the count; self's results publish
+          // immediately via the normal spawn.observed event instead (no
+          // pool at all, same as an area scan's self path), so counting
+          // needs a temporary listener on that event instead - the actual
+          // spawn parsing/normalization is identical either way, this is
+          // purely a bookkeeping difference for a decision area scan never
+          // needed to make at all.
+          let selfBaseCount = 0;
+          const unsubscribeSelfCounter = auth.isSelf ? bus.on("spawn.observed", () => selfBaseCount++) : null;
+          try {
+            await ahkConnector.sendCustomCommand(buildSpeciesScanCommand(dexNumber));
+          } finally {
+            unsubscribeSelfCounter?.();
+          }
+
+          const baseCount = scanId ? ((await state.pendingScanPools.get(scanId))?.spawns.length ?? 0) : selfBaseCount;
+          if (baseCount >= EXTENDED_SCAN_TRIGGER_COUNT) {
+            for (const command of buildExtendedSpeciesScanCommands(dexNumber)) {
+              if (!ahkConnector.isRunning()) break;
+              await ahkConnector.sendCustomCommand(command);
+            }
+          }
+        })
+      )
+      .then(async () => {
+        logger.info("ahk", `species scan done for dex #${dexNumber}`);
+        await finishPool();
+      })
+      .catch(async (err) => {
+        logger.error("ahk", `species scan failed: ${err.message}`);
+        await finishPool();
+      });
+
+    logger.info(
+      "worker",
+      `species scan request from ${fromPubkey.slice(0, 8)}… accepted (${auth.isSelf ? "operator" : "subscriber, cusuco charged"}) - ack sent (scanId=${scanId ?? "n/a"}, dex #${dexNumber})`
+    );
+    return { ok: true, scanId };
   });
 
   // Lets the requester (or the operator) read back a scan's private
