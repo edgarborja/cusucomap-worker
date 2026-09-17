@@ -298,7 +298,11 @@ async function startWorker(publicConfig, secretConfig) {
     logger,
     state,
     getGeofilterAnchor: () => publicConfig.geofilterAnchor,
-    getTrackedChannelIds: () => publicConfig.trackedChannelIds,
+    // The scan channel must actually be scraped too, or a subscriber's own
+    // scan replies would never reach the worker at all - deduped in case
+    // the operator also happens to list it among the general channels.
+    getTrackedChannelIds: () => [...new Set([...publicConfig.trackedChannelIds, ...(publicConfig.scanChannelId ? [publicConfig.scanChannelId] : [])])],
+    getScanChannelId: () => publicConfig.scanChannelId,
     getActiveScanId: () => activeScanId,
   });
   sourceFeedConnector.start();
@@ -406,39 +410,154 @@ async function startWorker(publicConfig, secretConfig) {
     return { ok: false, error };
   }
 
-  // How long to wait, with nothing else sent, before giving up and
-  // finalizing a subscriber scan's pool anyway - see
-  // finishSubscriberScanPool's own comment for why this is a fallback, not
-  // the primary signal.
-  const SCAN_POOL_QUIET_TIMEOUT_MS = 5000;
+  // A subscriber's scan retries its own single search this many additional
+  // times (so up to this + 1 total attempts) on a bot-error/no-reply
+  // outcome before giving up - confirmed live: a real Discord "The
+  // application did not respond" error, with no way to know in advance
+  // whether a retry would succeed.
+  const SCAN_MAX_RETRIES = 2;
+  // How long one attempt waits for a definitive signal (a result, an
+  // explicit "no results" ack, or a bot-error reply) before being treated
+  // as failed - generous enough for Discord's own reply latency, including
+  // the bot-error message itself, which can take a few seconds to surface.
+  const SCAN_REPLY_TIMEOUT_MS = 10_000;
+  // Once at least one result has arrived for an attempt, how much longer to
+  // wait with nothing further before considering that reply fully received
+  // - a /pokesearch reply split across multiple Discord messages arrives as
+  // a tight burst (confirmed live: well under 500ms between messages), so
+  // this only needs to be a small cushion over that.
+  const SCAN_REPLY_QUIET_MS = 1500;
+  // Pause before retrying a failed attempt - not trying to look human like
+  // the search-pacing pauses elsewhere, just not hammering Discord with the
+  // exact same command back-to-back after it just failed.
+  const SCAN_RETRY_PAUSE_MS = 2000;
 
-  // Finalizes a subscriber scan's pending pool (clears activeScanId, flips
-  // the pool from "collecting" to "pending") - but not immediately when
-  // this is called. A /pokesearch reply commonly splits across several
-  // Discord messages, and continuation ones can arrive a moment after the
-  // scan's own single AHK send has already resolved - confirmed live: an
-  // area scan's first reply message landed in its pool correctly, but two
-  // continuation messages (4 results each) arrived just after activeScanId
-  // used to get cleared immediately here, and leaked into the public feed
-  // instead of the private pool. As long as nothing *else* has been sent
-  // since, any source-feed message arriving can only be a reply to this
-  // scan, so it's safe to keep attributing it - so this defers the actual
-  // clearing until whichever comes first: the very next AHK send from
-  // anyone (ahkConnector.setPreSendHook - the normal schedule resuming, a
-  // daily command, another scan), or a fixed timeout with nothing sent, as
-  // a safety net against activeScanId never getting cleared if nothing else
-  // is ever sent again.
-  function finishSubscriberScanPool(scanId) {
-    if (!scanId) return;
-    let settled = false;
-    const clearNow = () => {
-      if (settled) return;
-      settled = true;
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Waits for `scanId`'s current search attempt to settle, using the
+   * scanReply.observed events source-feed-connector.js emits while
+   * activeScanId is set (see that file's #emitSpawn/#handleMessage).
+   * Resolves "ok" once either an explicit no-results ack arrives, or at
+   * least one result arrives and then SCAN_REPLY_QUIET_MS passes with
+   * nothing further. Resolves "error" the moment a bot-error reply arrives,
+   * or if nothing at all arrives within SCAN_REPLY_TIMEOUT_MS.
+   */
+  function waitForScanReply(scanId) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let quietTimer = null;
+      const finish = (outcome) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(quietTimer);
+        clearTimeout(hardTimer);
+        unsubscribe();
+        resolve(outcome);
+      };
+      const hardTimer = setTimeout(() => finish("error"), SCAN_REPLY_TIMEOUT_MS);
+      const unsubscribe = bus.on("scanReply.observed", (evt) => {
+        if (evt.scanId !== scanId) return;
+        if (evt.kind === "error") finish("error");
+        else if (evt.kind === "empty") finish("ok");
+        else {
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => finish("ok"), SCAN_REPLY_QUIET_MS);
+        }
+      });
+    });
+  }
+
+  // Reverses authorizeScanRequest's charge - a scan that never got a usable
+  // reply after every retry was exhausted shouldn't cost the subscriber
+  // their daily allowance. Safe even if the day rolled over since charging
+  // (scansUsedDate won't match today's key any more, so there's nothing to
+  // undo).
+  async function reimburseScanRequest(fromPubkey) {
+    const subscriber = await state.scanSubscribers.get(fromPubkey);
+    if (!subscriber || subscriber.scansUsedDate !== todayKey()) return;
+    await state.scanSubscribers.put({ ...subscriber, scansUsedToday: Math.max(0, (subscriber.scansUsedToday ?? 0) - 1) });
+  }
+
+  /**
+   * Runs a subscriber's single-search scan (area or species) end to end:
+   * acquires bulk-scan priority, sends the search in the dedicated second
+   * tab, waits for it to actually settle (see waitForScanReply) - retrying
+   * up to SCAN_MAX_RETRIES times on a bot-error/no-reply outcome - then
+   * switches back to the operator's own tab, all still inside the same
+   * priority window (AhkConnector#beginBulkScan), so nothing else (the
+   * scheduled loop, a daily command, another scan) can be sent while this
+   * waits.
+   *
+   * Replaces an earlier version that cleared activeScanId and switched
+   * tabs back immediately once the search was merely *sent*, with no idea
+   * whether it had actually gotten a reply - confirmed live to both leak a
+   * multi-message reply's continuation messages into the public feed (see
+   * the "project_scan_feature_v1_hexlattice" memory) and, worse, to
+   * occasionally leave activeScanId set long enough for an unrelated
+   * scheduled search's own results to be swept into the pool instead (a
+   * race between that fix's own pre-send hook registration and the
+   * scheduled loop's own gate-release continuation, both kicked off by the
+   * same event but not ordered relative to each other). Holding this
+   * mutex for the whole wait - not just the send - removes the race
+   * entirely: nothing else can be sent until *after* activeScanId has
+   * already been cleared below.
+   *
+   * On exhausted retries: reimburses the caller's cusuco and marks the pool
+   * "failed" rather than leaving it looking like a genuine zero-result scan
+   * (see getScanResults/PROTOCOL.md).
+   * @param {string} scanId
+   * @param {string} fromPubkey
+   * @param {() => string} buildCommand - called fresh for each attempt; the
+   *   command text itself never changes between retries.
+   * @returns {Promise<"ok"|"error">}
+   */
+  async function runSubscriberScan(scanId, fromPubkey, buildCommand) {
+    const release = ahkConnector.beginBulkScan();
+    try {
+      let outcome = "error";
+      for (let attempt = 0; attempt <= SCAN_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          logger.warn("worker", `scan ${scanId} attempt ${attempt + 1}/${SCAN_MAX_RETRIES + 1} - retrying after a bot error/no reply`);
+          await sleep(SCAN_RETRY_PAUSE_MS);
+        }
+        // waitForScanReply's own timeout is only started once the command
+        // has actually been dispatched (see sendCustomCommand's own doc
+        // comment) - not from here, since #sendChain may still be finishing
+        // something queued before this scan even started (a scheduled
+        // search's own settle pause can run several seconds past when this
+        // loop iteration began) and that wait shouldn't count against this
+        // attempt's own reply window.
+        let resolveDispatched;
+        const dispatched = new Promise((resolve) => {
+          resolveDispatched = resolve;
+        });
+        // Not awaited before `dispatched` resolves - #sendSerialized's own
+        // #sendChain already paces this correctly behind whatever else is
+        // queued, so there's no need to also block here on its full
+        // send+settle-pause before reacting to the reply.
+        ahkConnector.sendCustomCommand(buildCommand(), { onDispatched: resolveDispatched }).catch((err) => logger.error("ahk", `scan send failed: ${err.message}`));
+        await dispatched;
+        outcome = await waitForScanReply(scanId);
+        if (outcome === "ok") break;
+      }
+
       activeScanId = null;
-      state.pendingScanPools.markCollectingAsPending(scanId).catch((err) => logger.error("worker", `failed to finalize scan pool ${scanId}: ${err.message}`));
-    };
-    ahkConnector.setPreSendHook(clearNow);
-    setTimeout(clearNow, SCAN_POOL_QUIET_TIMEOUT_MS);
+      if (outcome === "ok") {
+        await state.pendingScanPools.markCollectingAsPending(scanId);
+      } else {
+        logger.warn("worker", `scan ${scanId} got no usable reply after ${SCAN_MAX_RETRIES + 1} attempts - reimbursing cusuco`);
+        await reimburseScanRequest(fromPubkey);
+        const pool = await state.pendingScanPools.get(scanId);
+        if (pool) await state.pendingScanPools.put({ ...pool, status: "failed" });
+      }
+      await ahkConnector.sendHotkey("^1");
+      return outcome;
+    } finally {
+      release();
+    }
   }
 
   // Authorizes a scan request (runAreaScan, runSpeciesScan) and, for a
@@ -449,6 +568,12 @@ async function startWorker(publicConfig, secretConfig) {
   // touched.
   async function authorizeScanRequest(fromPubkey, method) {
     if (fromPubkey === transport.identity.hex) return { ok: true, isSelf: true };
+    // A subscriber's scan results can only ever be safely attributed via
+    // the dedicated scan channel (see config.js's own scanChannelId doc
+    // comment) - without one configured there is nowhere for those results
+    // to safely land, so refuse rather than run a scan whose results could
+    // never be told apart from an organic sighting.
+    if (!publicConfig.scanChannelId) return rejectScanRequest(fromPubkey, method, "scan channel not configured - ask the operator to set one up.");
     const subscriber = await state.scanSubscribers.get(fromPubkey);
     if (!subscriber) return rejectScanRequest(fromPubkey, method, "no scan subscription found for this account.");
     if (new Date(subscriber.activeUntil).getTime() < Date.now()) return rejectScanRequest(fromPubkey, method, "scan subscription has expired.");
@@ -499,6 +624,7 @@ async function startWorker(publicConfig, secretConfig) {
     // one switch-tab/search/switch-back sequence in the dedicated second
     // tab instead of many self-contained circle commands.
     let total;
+    let scanId = null;
     let runScan;
     if (auth.isSelf) {
       const radiusKmText = String(params?.radiusKmText ?? "").trim();
@@ -509,18 +635,20 @@ async function startWorker(publicConfig, secretConfig) {
       const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
       total = points.length;
       runScan = () =>
-        ahkConnector.runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
-          beforeCommand: areaScanClearGeofilterCommand,
-          afterCommand: defaultGeofilterCommand,
-        });
+        ahkConnector
+          .runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
+            beforeCommand: areaScanClearGeofilterCommand,
+            afterCommand: defaultGeofilterCommand,
+          })
+          .then((result) => {
+            logger.info(
+              "ahk",
+              result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
+            );
+          });
     } else {
-      const point = { lat: centerLat, lon: centerLon };
       total = 1;
-      runScan = () => ahkConnector.runBulkScan([point], (p) => [buildSubscriberAreaScanCommand({ ...p, radiusKmText: subscriberScanRadiusKmText })]);
-    }
-
-    const scanId = auth.isSelf ? null : crypto.randomUUID();
-    if (scanId) {
+      scanId = crypto.randomUUID();
       activeScanId = scanId;
       // Not awaited - awaiting this here would delay the enableThenRun()
       // call below by at least a tick, which is exactly the race that
@@ -530,28 +658,21 @@ async function startWorker(publicConfig, secretConfig) {
       // #bulkScanGate at the top of its next iteration, so any gap here is
       // a window for it to queue a send first, stealing this scan's
       // priority. A local IndexedDB write completes in well under a
-      // millisecond in practice, long before the scan's own
-      // beforeCommand+settle-pause+first-search could possibly produce a
-      // spawn for #emitSpawn to append to this pool.
+      // millisecond in practice, long before this scan's own first send
+      // could possibly produce a reply for #emitSpawn to append to this pool.
       state.pendingScanPools
         .put({ scanId, scanType: "area", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
         .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
+      runScan = () =>
+        runSubscriberScan(scanId, fromPubkey, () => buildSubscriberAreaScanCommand({ lat: centerLat, lon: centerLon, radiusKmText: subscriberScanRadiusKmText })).then(
+          (outcome) => {
+            logger.info("ahk", outcome === "ok" ? "area scan done" : "area scan got no usable reply after retries - cusuco reimbursed");
+          }
+        );
     }
 
     // Deliberately not awaited - see this handler's own doc comment above.
-    ahkControls
-      .enableThenRun(runScan)
-      .then((result) => {
-        logger.info(
-          "ahk",
-          result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
-        );
-        finishSubscriberScanPool(scanId);
-      })
-      .catch((err) => {
-        logger.error("ahk", `area scan failed: ${err.message}`);
-        finishSubscriberScanPool(scanId);
-      });
+    ahkControls.enableThenRun(runScan).catch((err) => logger.error("ahk", `area scan failed: ${err.message}`));
 
     // The ack itself - returned as soon as the cusuco is charged and the
     // scan is confirmed to actually be starting (see the reordering above:
@@ -584,29 +705,33 @@ async function startWorker(publicConfig, secretConfig) {
     const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
     if (!auth.ok) return auth;
 
-    const scanId = auth.isSelf ? null : crypto.randomUUID();
-    if (scanId) {
+    let scanId = null;
+    let runScan;
+    if (auth.isSelf) {
+      const command = buildSpeciesScanCommand(dexNumber);
+      runScan = () =>
+        ahkConnector.runBulkScan([dexNumber], () => [command]).then((result) => {
+          logger.info("ahk", result.cancelled ? "species scan cancelled" : `species scan done for dex #${dexNumber}`);
+        });
+    } else {
+      scanId = crypto.randomUUID();
       activeScanId = scanId;
       // Not awaited - see runAreaScan's identical "no await gap before
       // enableThenRun" reasoning.
       state.pendingScanPools
         .put({ scanId, scanType: "species", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
         .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
+      runScan = () =>
+        runSubscriberScan(scanId, fromPubkey, () => buildSubscriberSpeciesScanCommand(dexNumber)).then((outcome) => {
+          logger.info(
+            "ahk",
+            outcome === "ok" ? `species scan done for dex #${dexNumber}` : `species scan for dex #${dexNumber} got no usable reply after retries - cusuco reimbursed`
+          );
+        });
     }
 
-    const command = auth.isSelf ? buildSpeciesScanCommand(dexNumber) : buildSubscriberSpeciesScanCommand(dexNumber);
-
     // Deliberately not awaited - see runAreaScan's own doc comment.
-    ahkControls
-      .enableThenRun(() => ahkConnector.runBulkScan([dexNumber], () => [command]))
-      .then((result) => {
-        logger.info("ahk", result.cancelled ? "species scan cancelled" : `species scan done for dex #${dexNumber}`);
-        finishSubscriberScanPool(scanId);
-      })
-      .catch((err) => {
-        logger.error("ahk", `species scan failed: ${err.message}`);
-        finishSubscriberScanPool(scanId);
-      });
+    ahkControls.enableThenRun(runScan).catch((err) => logger.error("ahk", `species scan failed: ${err.message}`));
 
     logger.info(
       "worker",
@@ -856,6 +981,7 @@ function populateSetupForm(publicConfig, secretConfig) {
   document.getElementById("field-relays").value = publicConfig.relays.join("\n");
   document.getElementById("field-source-feed-channels").value = publicConfig.trackedChannelIds.join("\n");
   document.getElementById("field-watch-channel-name").value = publicConfig.watchChannelName;
+  document.getElementById("field-scan-channel-id").value = publicConfig.scanChannelId;
   document.getElementById("field-google-client-id").value = publicConfig.googleClientId;
   document.getElementById("field-vapid-public").value = publicConfig.vapidPublicKey;
   document.getElementById("field-vapid-contact").value = publicConfig.vapidContact;
@@ -870,6 +996,7 @@ function readSetupForm() {
     relays: parseLines(document.getElementById("field-relays").value),
     trackedChannelIds: parseLines(document.getElementById("field-source-feed-channels").value),
     watchChannelName: document.getElementById("field-watch-channel-name").value.trim(),
+    scanChannelId: document.getElementById("field-scan-channel-id").value.trim(),
     googleClientId: document.getElementById("field-google-client-id").value.trim(),
     vapidPublicKey: document.getElementById("field-vapid-public").value.trim(),
     vapidContact: document.getElementById("field-vapid-contact").value.trim(),

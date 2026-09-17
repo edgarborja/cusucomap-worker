@@ -46,6 +46,10 @@
           <input id="field-watch-channel-name" type="text" />
         </label>
 
+        <label>Scan channel id <span class="hint">(the channel id the dedicated second browser tab sits on, used only for a subscriber's own "cusuco" scan replies - never scheduled searches or organic sightings. Leave blank to disable subscriber scans.)</span>
+          <input id="field-scan-channel-id" type="text" placeholder="123456789012345678" />
+        </label>
+
         <label>Google OAuth client id <span class="hint">(not secret - this is the audience, not a credential)</span>
           <input id="field-google-client-id" type="text" placeholder="xxxxxxxx.apps.googleusercontent.com" />
         </label>
@@ -92,7 +96,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-17 16:25 UTC</p>
+    <p id="build-date">Build: 2026-09-17 22:05 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>

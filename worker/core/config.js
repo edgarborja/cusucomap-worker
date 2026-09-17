@@ -26,6 +26,7 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
  * @property {boolean} rememberSecrets
  * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
  * @property {string} watchChannelName - sidebar dnd-name of the channel whose unread badge signals a hundo may have posted elsewhere (see worker/connectors/watch-channel-connector.js); pushed to the bridge the same way trackedChannelIds is.
+ * @property {string} scanChannelId - the Source Feed channel id the dedicated second browser tab (see area-scan.js's wrapForSubscriberScanTab) sits on, used *only* for a subscriber's own "cusuco" scan replies - never for scheduled searches, daily commands, or organic sightings. Pushed to the bridge alongside trackedChannelIds (so it actually gets scraped) but tracked separately here: source-feed-connector.js's #handleMessage only ever considers a message for a subscriber's private pool if it arrived on *this* channel, regardless of any activeScanId timing - a structural safety net, not just a timing one, against a normal search's own results ever leaking into a private pool (or vice versa). Empty means "not configured" - subscriber scans simply won't have anywhere safe to land until this is set.
  */
 
 /** @returns {PublicConfig} */
@@ -38,6 +39,7 @@ export function defaultPublicConfig() {
     vapidContact: "mailto:example@example.com",
     rememberSecrets: false,
     watchChannelName: "",
+    scanChannelId: "",
     // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
     // tracked channel's own /geofilter setting at the time this default was
     // captured.

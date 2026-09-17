@@ -98,9 +98,6 @@ export class AhkConnector {
   // one-at-a-time queue (see http_send.ahk's PumpQueue), which only
   // guarantees ordering, not that Discord's UI had time to settle in between.
   #sendChain = Promise.resolve();
-  // One-shot callback fired immediately before the very next queued send
-  // actually executes, regardless of who queued it - see setPreSendHook.
-  #preSendHook = null;
   // Lazily loaded from workerMetadata (falling back to getConfig()'s
   // hardcoded defaults if nothing's ever been persisted) - see
   // #loadCommandsIfNeeded. Cached here once loaded so repeated calls (every
@@ -241,14 +238,13 @@ export class AhkConnector {
    * so that message fired with no settle time at all.
    * @param {string} message
    * @param {{minS: number, maxS: number}} pause
+   * @param {() => void} [onDispatched] - called the instant this message's
+   *   own turn on the chain arrives, right before the real send - see
+   *   sendCustomCommand's own doc comment for why a caller might need this.
    */
-  #sendSerialized(message, pause) {
+  #sendSerialized(message, pause, onDispatched) {
     const run = this.#sendChain.then(async () => {
-      if (this.#preSendHook) {
-        const hook = this.#preSendHook;
-        this.#preSendHook = null;
-        hook();
-      }
+      onDispatched?.();
       await this.#send(message);
       await sleep(randomInt(pause.minS, pause.maxS) * 1000);
     });
@@ -257,31 +253,21 @@ export class AhkConnector {
   }
 
   /**
-   * Registers a one-shot callback that fires (and clears itself) right
-   * before the *next* queued send actually executes - whichever caller
-   * queues it: the scheduled loop resuming, a daily command, another scan,
-   * a dashboard "send now". Only ever one slot; a later call replaces an
-   * earlier, still-pending one rather than queuing both.
-   *
-   * Exists for worker-app.js's runAreaScan/runSpeciesScan: a subscriber
-   * scan's own single AHK send often gets a reply split across several
-   * Discord messages, and continuation ones can arrive a moment after that
-   * one send has already resolved. As long as nothing *else* has been sent
-   * since, any such arrival can only be a reply to this scan - so instead of
-   * clearing its pool's "still collecting" state on a fixed timer the
-   * instant its own send resolves, worker-app.js registers this hook (plus
-   * its own fallback timeout, in case nothing else is ever sent again) to
-   * find out exactly when that's no longer true.
-   * @param {() => void} fn
+   * Exposed for the dashboard "send now" form - outside the normal
+   * schedule. `onDispatched` (optional) fires the instant this message
+   * actually starts sending - i.e. once whatever else was already ahead of
+   * it on #sendChain (a scheduled search's own settle pause, mid-flight
+   * when this was called) has cleared. worker-app.js's runSubscriberScan
+   * uses this to start a scan attempt's own reply-wait clock only once the
+   * command has actually gone out, not from whenever this was merely
+   * *called* - confirmed live: a scheduled search already queued when a
+   * scan request arrived delayed the scan's own send by several seconds,
+   * which a wait clock started at call-time would burn through for no
+   * reason before the command had even reached Discord.
    */
-  setPreSendHook(fn) {
-    this.#preSendHook = fn;
-  }
-
-  /** Exposed for the dashboard "send now" form - outside the normal schedule. */
-  async sendCustomCommand(message) {
+  async sendCustomCommand(message, { onDispatched } = {}) {
     const { searchPauseMinS, searchPauseMaxS } = this.#getConfig();
-    await this.#sendSerialized(message, { minS: searchPauseMinS, maxS: searchPauseMaxS });
+    await this.#sendSerialized(message, { minS: searchPauseMinS, maxS: searchPauseMaxS }, onDispatched);
   }
 
   /**
@@ -478,5 +464,41 @@ export class AhkConnector {
       this.#bulkScanGate = Promise.resolve();
     }
     return { sent, total, cancelled };
+  }
+
+  /**
+   * Acquires the bulk-scan priority mutex without sending anything itself -
+   * for a caller whose own send sequence is conditional/variable rather
+   * than runBulkScan's fixed list-of-locations shape. Used by
+   * worker-app.js's runAreaScan/runSpeciesScan for a subscriber's scan:
+   * retry the same search a couple of times on an error reply, then switch
+   * back to the operator's own tab only once a real reply has actually been
+   * seen (or retries are exhausted) - genuinely can't be expressed as a
+   * fixed command list decided up front. Holding this mutex for that whole
+   * span is what guarantees nothing else (the scheduled loop, a daily
+   * command, another scan) can be sent while it's waiting, exactly like
+   * runBulkScan's own guarantee for its fixed-list callers.
+   * Throws the same "A scan is already running." as runBulkScan if one is
+   * already active.
+   * @returns {() => void} releases the mutex - MUST be called exactly once,
+   *   from a finally, same as runBulkScan's own.
+   */
+  beginBulkScan() {
+    if (this.#bulkScanActive) throw new Error("A scan is already running.");
+    this.#bulkScanActive = true;
+    this.#bulkScanCancelRequested = false;
+    let releaseGate;
+    this.#bulkScanGate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#bulkScanActive = false;
+      this.#bulkScanCancelRequested = false;
+      releaseGate();
+      this.#bulkScanGate = Promise.resolve();
+    };
   }
 }

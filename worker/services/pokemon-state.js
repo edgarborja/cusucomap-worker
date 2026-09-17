@@ -7,6 +7,12 @@ import { validateSpawn, validateQuest, validateRaid } from "../../shared/schemas
 
 const SWEEP_INTERVAL_MS = 60_000;
 
+// How long a "failed" pending scan pool (see worker-app.js's
+// runSubscriberScan) sticks around before #discardStalePendingScanPools
+// deletes it - long enough for the caller to poll getScanResults and
+// actually see the failure at least once.
+const FAILED_SCAN_POOL_GRACE_MS = 60 * 60_000; // 1 hour
+
 // How long past its own expiry an entity sticks around before actually
 // being deleted (not just status-flipped - see sweepExpired vs
 // pruneOlderThan in application-state.js) - keeps the local database from
@@ -56,21 +62,32 @@ export class PokemonStateService {
    * holds has despawned - at that point it's no more useful than an empty
    * one. Checked on this same 60s tick rather than the once-daily retention
    * trim, since a pool's own relevance window is minutes, not a day.
-   * Deliberately skips anything not "pending": a "collecting" pool is still
-   * owned by an in-flight runAreaScan call (an empty spawns array there
+   * Deliberately skips "collecting": that pool is still owned by an
+   * in-flight runAreaScan/runSpeciesScan call (an empty spawns array there
    * would otherwise look "all despawned" and get deleted out from under a
-   * scan that's still running), and an already-"broadcast" pool is kept as
+   * scan that's still running), and skips "broadcast": that pool is kept as
    * a record, same as an approved scan's spawns already are in
    * state.spawns itself.
+   *
+   * A "failed" pool (see runSubscriberScan) never holds any spawns at all,
+   * so "every spawn has despawned" is vacuously immediate - it's instead
+   * kept around for a fixed grace period from creation, long enough for the
+   * caller to poll getScanResults and actually see the failure, then
+   * discarded the same way.
    */
   async #discardStalePendingScanPools() {
     const pools = await this.#state.pendingScanPools.all();
     const now = Date.now();
     let discarded = 0;
     for (const pool of pools) {
-      if (pool.status !== "pending") continue;
-      const stillLive = pool.spawns.some((s) => new Date(s.despawnAt).getTime() > now);
-      if (stillLive) continue;
+      if (pool.status === "failed") {
+        if (now - pool.createdAt < FAILED_SCAN_POOL_GRACE_MS) continue;
+      } else if (pool.status === "pending") {
+        const stillLive = pool.spawns.some((s) => new Date(s.despawnAt).getTime() > now);
+        if (stillLive) continue;
+      } else {
+        continue;
+      }
       await this.#state.pendingScanPools.delete(pool.scanId);
       discarded++;
     }

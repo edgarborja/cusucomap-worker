@@ -109,16 +109,20 @@ const PART_SEPARATOR = "\x1f"; // ASCII Unit Separator - never appears in a coor
 
 /**
  * Wraps `commandText` to run in the dedicated second tab: switch to it,
- * type and submit `commandText`, switch back. Safe only because every
- * value ever interpolated into `commandText` by this file's own callers
- * (coordinates, the fixed radius) is already validated as plain digits/
- * `.`/`,`/`-`/`:`/space - never reuse this for less-controlled input
- * without re-checking that (the RunTabSwitchSearch side types it via
- * SendText, so it's typed literally regardless, but PART_SEPARATOR itself
- * must never appear inside it).
+ * type and submit `commandText`. Deliberately does NOT switch back to the
+ * first tab itself - worker-app.js's runAreaScan/runSpeciesScan queue that
+ * separately (`ahkConnector.sendHotkey("^1")`), only once they've actually
+ * seen a reply (possibly after retrying this same call a couple of times
+ * on an error reply first) - see http_send.ahk's RunTabSwitchSearch for the
+ * AHK-side half. Safe only because every value ever interpolated into
+ * `commandText` by this file's own callers (coordinates, the fixed radius)
+ * is already validated as plain digits/`.`/`,`/`-`/`:`/space - never reuse
+ * this for less-controlled input without re-checking that (the
+ * RunTabSwitchSearch side types it via SendText, so it's typed literally
+ * regardless, but PART_SEPARATOR itself must never appear inside it).
  */
 export function wrapForSubscriberScanTab(commandText) {
-  return `${TABSEARCH_PREFIX}^2${PART_SEPARATOR}${commandText}${PART_SEPARATOR}^1`;
+  return `${TABSEARCH_PREFIX}^2${PART_SEPARATOR}${commandText}`;
 }
 
 /** @param {{ lat: number, lon: number, radiusKmText: string }} point */
