@@ -98,6 +98,9 @@ export class AhkConnector {
   // one-at-a-time queue (see http_send.ahk's PumpQueue), which only
   // guarantees ordering, not that Discord's UI had time to settle in between.
   #sendChain = Promise.resolve();
+  // One-shot callback fired immediately before the very next queued send
+  // actually executes, regardless of who queued it - see setPreSendHook.
+  #preSendHook = null;
   // Lazily loaded from workerMetadata (falling back to getConfig()'s
   // hardcoded defaults if nothing's ever been persisted) - see
   // #loadCommandsIfNeeded. Cached here once loaded so repeated calls (every
@@ -241,11 +244,38 @@ export class AhkConnector {
    */
   #sendSerialized(message, pause) {
     const run = this.#sendChain.then(async () => {
+      if (this.#preSendHook) {
+        const hook = this.#preSendHook;
+        this.#preSendHook = null;
+        hook();
+      }
       await this.#send(message);
       await sleep(randomInt(pause.minS, pause.maxS) * 1000);
     });
     this.#sendChain = run.catch(() => {}); // one failed send must not wedge the chain forever
     return run;
+  }
+
+  /**
+   * Registers a one-shot callback that fires (and clears itself) right
+   * before the *next* queued send actually executes - whichever caller
+   * queues it: the scheduled loop resuming, a daily command, another scan,
+   * a dashboard "send now". Only ever one slot; a later call replaces an
+   * earlier, still-pending one rather than queuing both.
+   *
+   * Exists for worker-app.js's runAreaScan/runSpeciesScan: a subscriber
+   * scan's own single AHK send often gets a reply split across several
+   * Discord messages, and continuation ones can arrive a moment after that
+   * one send has already resolved. As long as nothing *else* has been sent
+   * since, any such arrival can only be a reply to this scan - so instead of
+   * clearing its pool's "still collecting" state on a fixed timer the
+   * instant its own send resolves, worker-app.js registers this hook (plus
+   * its own fallback timeout, in case nothing else is ever sent again) to
+   * find out exactly when that's no longer true.
+   * @param {() => void} fn
+   */
+  setPreSendHook(fn) {
+    this.#preSendHook = fn;
   }
 
   /** Exposed for the dashboard "send now" form - outside the normal schedule. */

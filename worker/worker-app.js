@@ -406,6 +406,41 @@ async function startWorker(publicConfig, secretConfig) {
     return { ok: false, error };
   }
 
+  // How long to wait, with nothing else sent, before giving up and
+  // finalizing a subscriber scan's pool anyway - see
+  // finishSubscriberScanPool's own comment for why this is a fallback, not
+  // the primary signal.
+  const SCAN_POOL_QUIET_TIMEOUT_MS = 5000;
+
+  // Finalizes a subscriber scan's pending pool (clears activeScanId, flips
+  // the pool from "collecting" to "pending") - but not immediately when
+  // this is called. A /pokesearch reply commonly splits across several
+  // Discord messages, and continuation ones can arrive a moment after the
+  // scan's own single AHK send has already resolved - confirmed live: an
+  // area scan's first reply message landed in its pool correctly, but two
+  // continuation messages (4 results each) arrived just after activeScanId
+  // used to get cleared immediately here, and leaked into the public feed
+  // instead of the private pool. As long as nothing *else* has been sent
+  // since, any source-feed message arriving can only be a reply to this
+  // scan, so it's safe to keep attributing it - so this defers the actual
+  // clearing until whichever comes first: the very next AHK send from
+  // anyone (ahkConnector.setPreSendHook - the normal schedule resuming, a
+  // daily command, another scan), or a fixed timeout with nothing sent, as
+  // a safety net against activeScanId never getting cleared if nothing else
+  // is ever sent again.
+  function finishSubscriberScanPool(scanId) {
+    if (!scanId) return;
+    let settled = false;
+    const clearNow = () => {
+      if (settled) return;
+      settled = true;
+      activeScanId = null;
+      state.pendingScanPools.markCollectingAsPending(scanId).catch((err) => logger.error("worker", `failed to finalize scan pool ${scanId}: ${err.message}`));
+    };
+    ahkConnector.setPreSendHook(clearNow);
+    setTimeout(clearNow, SCAN_POOL_QUIET_TIMEOUT_MS);
+  }
+
   // Authorizes a scan request (runAreaScan, runSpeciesScan) and, for a
   // non-self caller, charges one scan against their daily "cusuco" quota in
   // the same call - see worker/storage/indexeddb.js's own comment on why
@@ -503,25 +538,19 @@ async function startWorker(publicConfig, secretConfig) {
         .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
     }
 
-    async function finishPool() {
-      if (!scanId) return;
-      activeScanId = null;
-      await state.pendingScanPools.markCollectingAsPending(scanId);
-    }
-
     // Deliberately not awaited - see this handler's own doc comment above.
     ahkControls
       .enableThenRun(runScan)
-      .then(async (result) => {
+      .then((result) => {
         logger.info(
           "ahk",
           result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
         );
-        await finishPool();
+        finishSubscriberScanPool(scanId);
       })
-      .catch(async (err) => {
+      .catch((err) => {
         logger.error("ahk", `area scan failed: ${err.message}`);
-        await finishPool();
+        finishSubscriberScanPool(scanId);
       });
 
     // The ack itself - returned as soon as the cusuco is charged and the
@@ -565,24 +594,18 @@ async function startWorker(publicConfig, secretConfig) {
         .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
     }
 
-    async function finishPool() {
-      if (!scanId) return;
-      activeScanId = null;
-      await state.pendingScanPools.markCollectingAsPending(scanId);
-    }
-
     const command = auth.isSelf ? buildSpeciesScanCommand(dexNumber) : buildSubscriberSpeciesScanCommand(dexNumber);
 
     // Deliberately not awaited - see runAreaScan's own doc comment.
     ahkControls
       .enableThenRun(() => ahkConnector.runBulkScan([dexNumber], () => [command]))
-      .then(async (result) => {
+      .then((result) => {
         logger.info("ahk", result.cancelled ? "species scan cancelled" : `species scan done for dex #${dexNumber}`);
-        await finishPool();
+        finishSubscriberScanPool(scanId);
       })
-      .catch(async (err) => {
+      .catch((err) => {
         logger.error("ahk", `species scan failed: ${err.message}`);
-        await finishPool();
+        finishSubscriberScanPool(scanId);
       });
 
     logger.info(
