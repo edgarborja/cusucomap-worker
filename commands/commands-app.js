@@ -294,7 +294,7 @@ function makeScanSubscriberRow(sub) {
 
   const noteEl = document.createElement("input");
   noteEl.type = "text";
-  noteEl.placeholder = "note";
+  noteEl.placeholder = "public tag (blank = anonymous code)";
   noteEl.value = sub.note || "";
 
   const usedEl = document.createElement("span");

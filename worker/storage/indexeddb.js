@@ -48,11 +48,11 @@ const STORE_DEFS = {
   // shared/crc16.js) is also computed once, at that same first-encounter
   // moment, and never recomputed - it's what approveScanResults stamps
   // onto shared spawns as an anonymous-but-consistent "who found this"
-  // marker (see PROTOCOL.md's Spawn content). displayNameOverride doesn't
-  // exist yet - a later feature will let the operator replace a
-  // subscriber's raw tag with a real name/alias, with that subscriber's
-  // approval; approveScanResults already prefers it over attributionTag
-  // when present, so adding it later needs no code change there.
+  // marker (see PROTOCOL.md's Spawn content), but only as the *default* -
+  // the admin panel's own "note" field doubles as a public override when
+  // the operator sets one (e.g. a subscriber's real name/alias, at their
+  // request); approveScanResults already prefers a non-empty note over
+  // attributionTag.
   // dailyLimit (null/absent = use scanDailyLimitPerSubscriber, the
   // fleet-wide default in defaultAhkConfig()) lets the operator grant a
   // specific subscriber more (or fewer) scans/day than everyone else -

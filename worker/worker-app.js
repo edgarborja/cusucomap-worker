@@ -393,20 +393,33 @@ async function startWorker(publicConfig, secretConfig) {
     return subscriber?.dailyLimit ?? defaultAhkConfig().scanDailyLimitPerSubscriber;
   }
 
-  // Authorizes a scan request (runAreaScan, and later runSpeciesScan) and,
-  // for a non-self caller, charges one scan against their daily "cusuco"
-  // quota in the same call - see worker/storage/indexeddb.js's own comment
-  // on why this ledger is its own store, never merged into
-  // pushSubscriptions. The operator's own (self) requests are always
-  // allowed, unlimited, no quota touched.
-  async function authorizeScanRequest(fromPubkey) {
+  // Every scan-request rejection goes through this, not a bare `return
+  // {ok:false,...}` - a request that never even shows up in the activity
+  // log (success is already logged, right before its own ack) is
+  // impossible to tell apart from "never arrived at all" when
+  // troubleshooting, which is exactly what made two near-simultaneous
+  // requests (one claims the #bulkScanActive mutex, the other gets
+  // silently rejected by it) look like a dropped request instead of a
+  // real, structurally-correct "only one scan at a time" rejection.
+  function rejectScanRequest(fromPubkey, method, error) {
+    logger.warn("worker", `${method} request from ${fromPubkey.slice(0, 8)}… rejected: ${error}`);
+    return { ok: false, error };
+  }
+
+  // Authorizes a scan request (runAreaScan, runSpeciesScan) and, for a
+  // non-self caller, charges one scan against their daily "cusuco" quota in
+  // the same call - see worker/storage/indexeddb.js's own comment on why
+  // this ledger is its own store, never merged into pushSubscriptions. The
+  // operator's own (self) requests are always allowed, unlimited, no quota
+  // touched.
+  async function authorizeScanRequest(fromPubkey, method) {
     if (fromPubkey === transport.identity.hex) return { ok: true, isSelf: true };
     const subscriber = await state.scanSubscribers.get(fromPubkey);
-    if (!subscriber) return { ok: false, error: "no scan subscription found for this account." };
-    if (new Date(subscriber.activeUntil).getTime() < Date.now()) return { ok: false, error: "scan subscription has expired." };
+    if (!subscriber) return rejectScanRequest(fromPubkey, method, "no scan subscription found for this account.");
+    if (new Date(subscriber.activeUntil).getTime() < Date.now()) return rejectScanRequest(fromPubkey, method, "scan subscription has expired.");
     const today = todayKey();
     const usedToday = subscriber.scansUsedDate === today ? (subscriber.scansUsedToday ?? 0) : 0;
-    if (usedToday >= resolveSubscriberDailyLimit(subscriber)) return { ok: false, error: "daily scan limit reached - resets tomorrow." };
+    if (usedToday >= resolveSubscriberDailyLimit(subscriber)) return rejectScanRequest(fromPubkey, method, "daily scan limit reached - resets tomorrow.");
     await state.scanSubscribers.put({ ...subscriber, scansUsedToday: usedToday + 1, scansUsedDate: today });
     return { ok: true, isSelf: false };
   }
@@ -435,12 +448,12 @@ async function startWorker(publicConfig, secretConfig) {
     // server-side constants below, not anything the caller supplied).
     const centerLat = Number(params?.centerLat);
     const centerLon = Number(params?.centerLon);
-    if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return { ok: false, error: "centerLat must be a number between -90 and 90." };
-    if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return { ok: false, error: "centerLon must be a number between -180 and 180." };
-    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
+    if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return rejectScanRequest(fromPubkey, "runAreaScan", "centerLat must be a number between -90 and 90.");
+    if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return rejectScanRequest(fromPubkey, "runAreaScan", "centerLon must be a number between -180 and 180.");
+    if (ahkConnector.isBulkScanActive()) return rejectScanRequest(fromPubkey, "runAreaScan", "A scan is already running.");
 
-    const auth = await authorizeScanRequest(fromPubkey);
-    if (!auth.ok) return { ok: false, error: auth.error };
+    const auth = await authorizeScanRequest(fromPubkey, "runAreaScan");
+    if (!auth.ok) return auth;
 
     const { subscriberScanRadiusKmText, areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
     // A subscriber never controls the per-circle radius or ring count -
@@ -451,8 +464,8 @@ async function startWorker(publicConfig, secretConfig) {
     const radiusKmText = auth.isSelf ? String(params?.radiusKmText ?? "").trim() : subscriberScanRadiusKmText;
     const radiusKm = Number(radiusKmText);
     const rings = auth.isSelf ? Number(params?.rings) : 1;
-    if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return { ok: false, error: "radiusKmText must be a positive number." };
-    if (!Number.isInteger(rings) || rings < 1 || rings > 5) return { ok: false, error: "rings must be an integer between 1 and 5." };
+    if (!radiusKmText || !Number.isFinite(radiusKm) || radiusKm <= 0) return rejectScanRequest(fromPubkey, "runAreaScan", "radiusKmText must be a positive number.");
+    if (!Number.isInteger(rings) || rings < 1 || rings > 5) return rejectScanRequest(fromPubkey, "runAreaScan", "rings must be an integer between 1 and 5.");
 
     const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
 
@@ -523,11 +536,11 @@ async function startWorker(publicConfig, secretConfig) {
   // AhkConnector#withBulkScanPriority, extracted for exactly this.
   rpc.handle("runSpeciesScan", async (params, { fromPubkey }) => {
     const dexNumber = Number(params?.dexNumber);
-    if (!isValidDexNumber(dexNumber)) return { ok: false, error: "dexNumber must be a positive integer below 4096." };
-    if (ahkConnector.isBulkScanActive()) return { ok: false, error: "A scan is already running." };
+    if (!isValidDexNumber(dexNumber)) return rejectScanRequest(fromPubkey, "runSpeciesScan", "dexNumber must be a positive integer below 4096.");
+    if (ahkConnector.isBulkScanActive()) return rejectScanRequest(fromPubkey, "runSpeciesScan", "A scan is already running.");
 
-    const auth = await authorizeScanRequest(fromPubkey);
-    if (!auth.ok) return { ok: false, error: auth.error };
+    const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
+    if (!auth.ok) return auth;
 
     const scanId = auth.isSelf ? null : crypto.randomUUID();
     if (scanId) {
@@ -621,15 +634,16 @@ async function startWorker(publicConfig, secretConfig) {
 
     // Anonymous-but-consistent attribution (see checkScanSubscription's own
     // comment on attributionTag) plus which kind of scan this was -
-    // PROTOCOL.md documents both as additive, optional Spawn fields.
-    // displayNameOverride doesn't exist yet (a later feature lets the
-    // operator set one, with the subscriber's approval) - checking for it
-    // here now means approveScanResults won't need to change when that
-    // ships. Falls back to a fixed placeholder rather than failing the
-    // whole approve if the requester's own ledger row is somehow gone (e.g.
-    // manually removed by the operator between request and approval).
+    // PROTOCOL.md documents both as additive, optional Spawn fields. The
+    // admin panel's own "note" field doubles as a public display-name
+    // override when set (the operator's call - see the panel's own label) -
+    // the CRC16 attributionTag is only ever the default/fallback, used
+    // whenever no note has been set. Falls back to a fixed placeholder
+    // rather than failing the whole approve if the requester's own ledger
+    // row is somehow gone (e.g. manually removed by the operator between
+    // request and approval).
     const requester = await state.scanSubscribers.get(pool.requestedByPubkeyHex);
-    const sharedByTag = requester?.displayNameOverride || requester?.attributionTag || "????";
+    const sharedByTag = requester?.note || requester?.attributionTag || "????";
     const discoveredVia = pool.scanType === "species" ? "species-scan" : "area-scan";
 
     for (const spawn of pool.spawns) bus.emit("spawn.observed", { ...spawn, discoveredVia, sharedByTag });

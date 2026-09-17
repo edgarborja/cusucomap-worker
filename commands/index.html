@@ -94,16 +94,19 @@
       <h2>Scan subscribers <span class="hint">("cusucos" - who can request a scan, and until when)</span></h2>
       <p class="lede">
         Only npubs listed here (with a not-yet-expired date) can request an area/species scan of their own. Each
-        gets a daily quota - 1 by default, or set "daily limit" per npub to grant more (or fewer). Adding an npub
-        already in the list updates its date/limit/note instead of duplicating it; leaving daily limit blank resets
+        gets a daily quota - 1 by default, or set "public tag" per npub to grant more (or fewer). Adding an npub
+        already in the list updates its date/limit/tag instead of duplicating it; leaving daily limit blank resets
         it to the default, and it never resets that npub's quota usage for today.
+        <strong>"Public tag" is shown to everyone</strong> on every spawn this npub shares, in place of their
+        anonymous auto-generated code - leave it blank unless a subscriber has actually asked to be identified
+        that way (e.g. a name or alias), since it replaces their anonymity.
       </p>
       <ul id="scan-subscribers-list" class="command-list"></ul>
       <form id="add-scan-subscriber-form" class="command-row">
         <input id="new-scan-subscriber-npub" type="text" placeholder="npub1..." />
         <input id="new-scan-subscriber-until" type="date" />
         <input id="new-scan-subscriber-limit" type="number" min="1" step="1" placeholder="daily limit (default)" />
-        <input id="new-scan-subscriber-note" type="text" placeholder="note (optional)" />
+        <input id="new-scan-subscriber-note" type="text" placeholder="public tag (blank = anonymous code)" />
         <button type="submit">Add / update</button>
       </form>
       <p id="scan-subscribers-status" hidden></p>
