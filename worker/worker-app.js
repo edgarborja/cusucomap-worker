@@ -505,6 +505,16 @@ async function startWorker(publicConfig, secretConfig) {
    * entirely: nothing else can be sent until *after* activeScanId has
    * already been cleared below.
    *
+   * Sends via AhkConnector#sendImmediate/#sendHotkeyImmediate, not
+   * sendCustomCommand/sendHotkey - a scan's own command types into the
+   * dedicated second tab, never the operator's own, so it doesn't need to
+   * wait behind #sendChain's usual settle pause the way a normal scheduled
+   * search does (see sendImmediate's own doc comment for why that's safe,
+   * and its "needs live verification" caveat). Confirmed live this pause
+   * could otherwise stack up to several extra seconds of pure wait onto a
+   * scan's own reply latency, with no way for a caller polling
+   * getScanResults to tell that apart from the scan itself taking that long.
+   *
    * On exhausted retries: reimburses the caller's cusuco and marks the pool
    * "failed" rather than leaving it looking like a genuine zero-result scan
    * (see getScanResults/PROTOCOL.md).
@@ -523,23 +533,10 @@ async function startWorker(publicConfig, secretConfig) {
           logger.warn("worker", `scan ${scanId} attempt ${attempt + 1}/${SCAN_MAX_RETRIES + 1} - retrying after a bot error/no reply`);
           await sleep(SCAN_RETRY_PAUSE_MS);
         }
-        // waitForScanReply's own timeout is only started once the command
-        // has actually been dispatched (see sendCustomCommand's own doc
-        // comment) - not from here, since #sendChain may still be finishing
-        // something queued before this scan even started (a scheduled
-        // search's own settle pause can run several seconds past when this
-        // loop iteration began) and that wait shouldn't count against this
-        // attempt's own reply window.
-        let resolveDispatched;
-        const dispatched = new Promise((resolve) => {
-          resolveDispatched = resolve;
-        });
-        // Not awaited before `dispatched` resolves - #sendSerialized's own
-        // #sendChain already paces this correctly behind whatever else is
-        // queued, so there's no need to also block here on its full
-        // send+settle-pause before reacting to the reply.
-        ahkConnector.sendCustomCommand(buildCommand(), { onDispatched: resolveDispatched }).catch((err) => logger.error("ahk", `scan send failed: ${err.message}`));
-        await dispatched;
+        // waitForScanReply's own timeout starts only once sendImmediate's
+        // own await resolves - i.e. once AHK has actually queued the
+        // command, not from whenever this loop iteration merely began.
+        await ahkConnector.sendImmediate(buildCommand()).catch((err) => logger.error("ahk", `scan send failed: ${err.message}`));
         outcome = await waitForScanReply(scanId);
         if (outcome === "ok") break;
       }
@@ -553,7 +550,7 @@ async function startWorker(publicConfig, secretConfig) {
         const pool = await state.pendingScanPools.get(scanId);
         if (pool) await state.pendingScanPools.put({ ...pool, status: "failed" });
       }
-      await ahkConnector.sendHotkey("^1");
+      await ahkConnector.sendHotkeyImmediate("^1");
       return outcome;
     } finally {
       release();

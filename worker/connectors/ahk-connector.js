@@ -238,13 +238,9 @@ export class AhkConnector {
    * so that message fired with no settle time at all.
    * @param {string} message
    * @param {{minS: number, maxS: number}} pause
-   * @param {() => void} [onDispatched] - called the instant this message's
-   *   own turn on the chain arrives, right before the real send - see
-   *   sendCustomCommand's own doc comment for why a caller might need this.
    */
-  #sendSerialized(message, pause, onDispatched) {
+  #sendSerialized(message, pause) {
     const run = this.#sendChain.then(async () => {
-      onDispatched?.();
       await this.#send(message);
       await sleep(randomInt(pause.minS, pause.maxS) * 1000);
     });
@@ -252,22 +248,46 @@ export class AhkConnector {
     return run;
   }
 
-  /**
-   * Exposed for the dashboard "send now" form - outside the normal
-   * schedule. `onDispatched` (optional) fires the instant this message
-   * actually starts sending - i.e. once whatever else was already ahead of
-   * it on #sendChain (a scheduled search's own settle pause, mid-flight
-   * when this was called) has cleared. worker-app.js's runSubscriberScan
-   * uses this to start a scan attempt's own reply-wait clock only once the
-   * command has actually gone out, not from whenever this was merely
-   * *called* - confirmed live: a scheduled search already queued when a
-   * scan request arrived delayed the scan's own send by several seconds,
-   * which a wait clock started at call-time would burn through for no
-   * reason before the command had even reached Discord.
-   */
-  async sendCustomCommand(message, { onDispatched } = {}) {
+  /** Exposed for the dashboard "send now" form - outside the normal schedule. */
+  async sendCustomCommand(message) {
     const { searchPauseMinS, searchPauseMaxS } = this.#getConfig();
-    await this.#sendSerialized(message, { minS: searchPauseMinS, maxS: searchPauseMaxS }, onDispatched);
+    await this.#sendSerialized(message, { minS: searchPauseMinS, maxS: searchPauseMaxS });
+  }
+
+  /**
+   * Sends `message` straight to AHK, bypassing #sendChain's usual
+   * serialization/settle-pause entirely - safe ONLY for a message that
+   * never touches the operator's own tab's compose box, since the entire
+   * reason #sendChain's trailing pause exists is to give *that* tab's UI
+   * time to visually settle before the next command types into it (see
+   * #sendSerialized's own comment) - a concern that doesn't apply to
+   * something that types into the dedicated second tab instead, or that
+   * only changes focus and never types anything at all. AHK's own
+   * PumpQueue/`busy` flag (see worker-bridge/http_send.ahk) still
+   * guarantees this can't execute concurrently with whatever's already
+   * mid-flight there, so the only thing skipped here is the *extra*
+   * wall-clock wait the normal schedule needs but this doesn't.
+   *
+   * Used by worker-app.js's runSubscriberScan for a subscriber scan's own
+   * TABSEARCH send and its final switch-back hotkey (see sendHotkeyImmediate
+   * below) - confirmed live that a scan's own command could otherwise sit
+   * behind a scheduled search's full 8-15s settle pause before even being
+   * queued, adding many seconds of pure wait the viewer has no way to
+   * distinguish from the scan actually taking that long.
+   *
+   * NEEDS LIVE VERIFICATION before this is trusted beyond that one caller:
+   * switching away from the operator's own tab while Discord's UI there
+   * hasn't finished visually settling (not AHK's own execution, which is
+   * already serialized) is untested from here - confirm it doesn't cause
+   * any glitch in the real browser before relying on it elsewhere.
+   */
+  async sendImmediate(message) {
+    await this.#send(message);
+  }
+
+  /** Same as sendImmediate, but for a hotkey press (see sendHotkey's own HOTKEY_PREFIX convention). */
+  async sendHotkeyImmediate(spec) {
+    await this.#send(`${HOTKEY_PREFIX}${spec}`);
   }
 
   /**
