@@ -819,6 +819,11 @@ async function startWorker(publicConfig, secretConfig) {
   // manually hand over their own npub out of band. Never grants anything
   // itself - an auto-created row's activeUntil is always null, which reads
   // as "not active" exactly like an admin-set one that's expired.
+  // seenCount reaching this many checkScanSubscription calls is what
+  // frequentVisitor (below) reports - purely a viewer-facing courtesy
+  // signal (e.g. "welcome back" copy), no effect on cusuco access/quota.
+  const FREQUENT_VISITOR_THRESHOLD = 10;
+
   rpc.handle("checkScanSubscription", async (_params, { fromPubkey }) => {
     const now = Date.now();
     const existing = await state.scanSubscribers.get(fromPubkey);
@@ -860,6 +865,7 @@ async function startWorker(publicConfig, secretConfig) {
       active: isActive,
       activeUntil: subscriber.activeUntil,
       cusucosRemaining: isActive ? Math.max(0, resolveSubscriberDailyLimit(subscriber) - usedToday) : 0,
+      frequentVisitor: subscriber.seenCount >= FREQUENT_VISITOR_THRESHOLD,
     };
   });
 
