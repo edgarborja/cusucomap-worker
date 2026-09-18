@@ -556,11 +556,14 @@ async function startWorker(publicConfig, secretConfig) {
       activeScanId = null;
       if (outcome === "ok") {
         await state.pendingScanPools.markCollectingAsPending(scanId);
+        const pool = await state.pendingScanPools.get(scanId);
+        logger.info("worker", `scan ${scanId} status: collecting -> pending (${pool?.spawns.length ?? 0} spawn(s))`);
       } else {
         logger.warn("worker", `scan ${scanId} got no usable reply after ${SCAN_MAX_RETRIES + 1} attempts - reimbursing cusuco`);
         await reimburseScanRequest(fromPubkey);
         const pool = await state.pendingScanPools.get(scanId);
         if (pool) await state.pendingScanPools.put({ ...pool, status: "failed" });
+        logger.info("worker", `scan ${scanId} status: collecting -> failed`);
       }
       await ahkConnector.sendHotkeyImmediate("^1");
       return outcome;
@@ -800,6 +803,7 @@ async function startWorker(publicConfig, secretConfig) {
 
     for (const spawn of pool.spawns) bus.emit("spawn.observed", { ...spawn, discoveredVia, sharedByTag });
     await state.pendingScanPools.put({ ...pool, status: "broadcast" });
+    logger.info("worker", `scan ${pool.scanId} status: ${pool.status} -> broadcast (${pool.spawns.length} published)`);
     return { ok: true, published: pool.spawns.length };
   });
 
