@@ -418,19 +418,31 @@ async function startWorker(publicConfig, secretConfig) {
   const SCAN_MAX_RETRIES = 2;
   // How long one attempt waits for a definitive signal (a result, an
   // explicit "no results" ack, or a bot-error reply) before being treated
-  // as failed - generous enough for Discord's own reply latency, including
-  // the bot-error message itself, which can take a few seconds to surface.
-  const SCAN_REPLY_TIMEOUT_MS = 10_000;
+  // as failed. This has to cover more than just Discord's own reply
+  // latency: sendImmediate's own await only resolves once AHK has
+  // acknowledged *queuing* the command, well before it's actually typed -
+  // AHK responds instantly and only then switches tabs, settles, and types
+  // it character by character (see http_send.ahk's RunTabSwitchSearch),
+  // all of which eats into this budget before Enter is even pressed. There
+  // is no signal at all, today, for exactly when that happens - AHK never
+  // reports back once a command is actually submitted, only that it was
+  // queued - so this has to be generous enough to absorb that dispatch
+  // overhead *and* Discord's own reply latency *and* the bridge's own
+  // scrape/detection latency on top of that. Confirmed live: a genuinely
+  // successful reply that simply hadn't been detected by the bridge yet
+  // triggered a false-timeout retry at the old, shorter value.
+  const SCAN_REPLY_TIMEOUT_MS = 25_000;
   // Once at least one result has arrived for an attempt, how much longer to
   // wait with nothing further before considering that reply fully received
   // - a /pokesearch reply split across multiple Discord messages arrives as
-  // a tight burst (confirmed live: well under 500ms between messages), so
-  // this only needs to be a small cushion over that.
-  const SCAN_REPLY_QUIET_MS = 1500;
+  // a tight burst (confirmed live: well under 500ms between messages, though
+  // one observed gap ran to ~1.5s), so this only needs a modest cushion
+  // over that, not anywhere near the full reply-timeout above.
+  const SCAN_REPLY_QUIET_MS = 2000;
   // Pause before retrying a failed attempt - not trying to look human like
   // the search-pacing pauses elsewhere, just not hammering Discord with the
   // exact same command back-to-back after it just failed.
-  const SCAN_RETRY_PAUSE_MS = 2000;
+  const SCAN_RETRY_PAUSE_MS = 3000;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
