@@ -869,11 +869,43 @@ async function startWorker(publicConfig, secretConfig) {
     };
   });
 
+  // Every visitor who's ever called checkScanSubscription gets a row here
+  // (see that handler), most of which never get granted access - as the
+  // map's own visitor count grows, an unpaginated response eventually
+  // exceeds relay event-size limits (confirmed live: "event too large").
+  const SCAN_SUBSCRIBERS_PAGE_SIZE = 20;
+
+  // Granted subscribers (activeUntil set) first, soonest-to-expire first -
+  // the operator's most actionable view (who needs renewal attention) -
+  // tie-broken by seenCount descending; never-granted visitors (activeUntil
+  // null) after all of those, sorted by seenCount descending so the most
+  // frequent unreviewed visitors surface first within that group. Relies on
+  // Array#sort's stability (guaranteed since ES2019) for any remaining tie,
+  // rather than a third explicit key.
+  function compareScanSubscribers(a, b) {
+    const aGranted = Boolean(a.activeUntil);
+    const bGranted = Boolean(b.activeUntil);
+    if (aGranted !== bGranted) return aGranted ? -1 : 1;
+    if (aGranted) {
+      const byActiveUntil = new Date(a.activeUntil).getTime() - new Date(b.activeUntil).getTime();
+      if (byActiveUntil !== 0) return byActiveUntil;
+    }
+    return (b.seenCount ?? 0) - (a.seenCount ?? 0);
+  }
+
   // Admin-only (self-pubkey) view/edit of the scan-subscriber ledger - see
-  // worker/storage/indexeddb.js's own comment on scanSubscribers.
-  rpc.handle("listScanSubscribers", async (_params, { fromPubkey }) => {
+  // worker/storage/indexeddb.js's own comment on scanSubscribers. Paginated
+  // (see SCAN_SUBSCRIBERS_PAGE_SIZE/compareScanSubscribers above) - sorted
+  // fresh, then sliced, on every call, so an admin paging through stays
+  // consistent only as long as nothing else edits the ledger mid-browse (an
+  // accepted, minor edge case for an admin-only tool like this).
+  rpc.handle("listScanSubscribers", async (params, { fromPubkey }) => {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
-    return { ok: true, subscribers: await state.scanSubscribers.all() };
+    const offset = Math.max(0, Number(params?.offset) || 0);
+    const all = await state.scanSubscribers.all();
+    all.sort(compareScanSubscribers);
+    const subscribers = all.slice(offset, offset + SCAN_SUBSCRIBERS_PAGE_SIZE);
+    return { ok: true, subscribers, total: all.length, hasMore: offset + SCAN_SUBSCRIBERS_PAGE_SIZE < all.length };
   });
   rpc.handle("setScanSubscriber", async (params, { fromPubkey }) => {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };

@@ -126,6 +126,12 @@ let relays = [];
 let secretKey = null;
 let pubkeyHex = null;
 
+// Current page into the scan-subscribers list - see refreshScanSubscribers.
+// Matches worker-app.js's own SCAN_SUBSCRIBERS_PAGE_SIZE; listScanSubscribers
+// itself decides the actual page size, this is only used to step by one page.
+const SCAN_SUBSCRIBERS_PAGE_SIZE = 20;
+let scanSubscribersOffset = 0;
+
 async function callSelf(method, params) {
   const response = await callRpc({ NT: nostrTools(), pool, relays, secretKey, pubkeyHex, method, params });
   if (!response.ok) throw new Error(response.error ?? `${method} failed`);
@@ -157,7 +163,6 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     pool = new NT.SimplePool({ enablePing: true, enableReconnect: true });
 
     const commands = await callSelf("getAhkCommands");
-    const subscribers = await callSelf("listScanSubscribers");
 
     if (document.getElementById("field-remember").checked) {
       localStorage.setItem(REMEMBER_KEY, JSON.stringify({ nsec, relaysText: document.getElementById("field-relays").value }));
@@ -169,7 +174,7 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     document.getElementById("worker-npub").hidden = false;
     renderScheduled(commands.scheduledSearches);
     renderDaily(commands.dailyCommands);
-    renderScanSubscribers(subscribers.subscribers);
+    await refreshScanSubscribers(0);
     document.getElementById("connect-screen").hidden = true;
     document.getElementById("commands-screen").hidden = false;
   } catch (err) {
@@ -331,7 +336,11 @@ function makeScanSubscriberRow(sub) {
     document.getElementById("scan-subscribers-error").hidden = true;
     try {
       await callSelf("removeScanSubscriber", { npub });
-      li.remove();
+      // Refreshes the current page rather than just li.remove() - removing
+      // a row shifts the page's own total/boundaries (the next page's
+      // first row now belongs on this one), which a purely local DOM
+      // removal would leave the pager's own count/label stale about.
+      await refreshScanSubscribers();
     } catch (err) {
       reportError(err);
     }
@@ -346,6 +355,29 @@ function renderScanSubscribers(subscribers) {
   list.innerHTML = "";
   for (const sub of subscribers) list.append(makeScanSubscriberRow(sub));
 }
+
+// Re-fetches and re-renders one page of the scan-subscribers list, and
+// updates the pager's own label/button state - the single place every
+// caller (initial connect, after add/save, Prev/Next) goes through, so
+// scanSubscribersOffset and what's on screen can never drift apart.
+async function refreshScanSubscribers(offset = scanSubscribersOffset) {
+  scanSubscribersOffset = Math.max(0, offset);
+  const result = await callSelf("listScanSubscribers", { offset: scanSubscribersOffset });
+  renderScanSubscribers(result.subscribers);
+  const total = result.total ?? result.subscribers.length;
+  const from = total === 0 ? 0 : scanSubscribersOffset + 1;
+  const to = scanSubscribersOffset + result.subscribers.length;
+  document.getElementById("scan-subscribers-page-info").textContent = `${from}–${to} of ${total}`;
+  document.getElementById("scan-subscribers-prev").disabled = scanSubscribersOffset === 0;
+  document.getElementById("scan-subscribers-next").disabled = !result.hasMore;
+}
+
+document.getElementById("scan-subscribers-prev").addEventListener("click", () => {
+  refreshScanSubscribers(scanSubscribersOffset - SCAN_SUBSCRIBERS_PAGE_SIZE);
+});
+document.getElementById("scan-subscribers-next").addEventListener("click", () => {
+  refreshScanSubscribers(scanSubscribersOffset + SCAN_SUBSCRIBERS_PAGE_SIZE);
+});
 
 document.getElementById("add-scan-subscriber-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -368,11 +400,13 @@ document.getElementById("add-scan-subscriber-form").addEventListener("submit", a
 
   try {
     await callSelf("setScanSubscriber", { npub, activeUntil, dailyLimit, note });
-    // Re-render from the worker's own confirmed list, not just this one
-    // addition - catches both a genuinely new row and an update to an
-    // existing one (same npub) without needing to tell those apart here.
-    const subscribers = await callSelf("listScanSubscribers");
-    renderScanSubscribers(subscribers.subscribers);
+    // Re-render the current page from the worker's own confirmed list, not
+    // just this one addition - catches both a genuinely new row and an
+    // update to an existing one (same npub) without needing to tell those
+    // apart here. Stays on whatever page the operator was already viewing
+    // rather than jumping back to the first one - the new/updated row may
+    // not even land on this page, depending on where it now sorts.
+    await refreshScanSubscribers();
     npubInput.value = "";
     untilInput.value = "";
     limitInput.value = "";
