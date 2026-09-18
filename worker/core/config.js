@@ -134,6 +134,16 @@ export function defaultAhkConfig() {
     // operator's own (self-pubkey) scans, which still use the full
     // hex-lattice/rings design with their own radius as today.
     subscriberScanRadiusKmText: "0.1",
+    // Fixed center/radius embedded in every subscriber species scan command
+    // (see species-scan.js's buildSubscriberSpeciesScanCommand) - same
+    // reasoning as subscriberScanRadiusKmText above: the dedicated scan
+    // channel carries no ambient geofilter of its own, so a species search
+    // there has to carry its own explicit area or it isn't restricted to
+    // anywhere near this map at all. Same center as defaultGeofilterCommand
+    // above (the tracked channel's own default /geofilter setting).
+    subscriberSpeciesScanCenterLat: 13.67744,
+    subscriberSpeciesScanCenterLon: -89.283353,
+    subscriberSpeciesScanRadiusKmText: "10",
   };
 }
 

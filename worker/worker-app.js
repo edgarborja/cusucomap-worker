@@ -705,6 +705,8 @@ async function startWorker(publicConfig, secretConfig) {
     const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
     if (!auth.ok) return auth;
 
+    const { subscriberSpeciesScanCenterLat, subscriberSpeciesScanCenterLon, subscriberSpeciesScanRadiusKmText } = defaultAhkConfig();
+
     let scanId = null;
     let runScan;
     if (auth.isSelf) {
@@ -722,7 +724,13 @@ async function startWorker(publicConfig, secretConfig) {
         .put({ scanId, scanType: "species", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
         .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
       runScan = () =>
-        runSubscriberScan(scanId, fromPubkey, () => buildSubscriberSpeciesScanCommand(dexNumber)).then((outcome) => {
+        runSubscriberScan(scanId, fromPubkey, () =>
+          buildSubscriberSpeciesScanCommand(dexNumber, {
+            lat: subscriberSpeciesScanCenterLat,
+            lon: subscriberSpeciesScanCenterLon,
+            radiusKmText: subscriberSpeciesScanRadiusKmText,
+          })
+        ).then((outcome) => {
           logger.info(
             "ahk",
             outcome === "ok" ? `species scan done for dex #${dexNumber}` : `species scan for dex #${dexNumber} got no usable reply after retries - cusuco reimbursed`
