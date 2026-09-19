@@ -1,14 +1,14 @@
 // Area-scan command building - two different shapes for two different
-// callers (see worker-app.js's runAreaScan):
+// callers (see worker-app.js's runAreaScan), both submitted through
+// miniscord (see worker/connectors/miniscord-connector.js):
 //
 // - The operator's own commands-page scans (self) keep the original
 //   hex-lattice design unchanged: a triangular lattice of many small
-//   circles, each its own self-contained /pokesearch command, run in the
-//   operator's own normal browser tab.
-// - A subscriber-requested scan runs a single search in a second,
-//   dedicated browser tab instead (see the
-//   "project_scan_feature_v1_hexlattice" memory for the two earlier
-//   designs this replaced, and why).
+//   circles, each its own self-contained /pokesearch command.
+// - A subscriber-requested scan is a single search instead (see the
+//   "project_scan_feature_v1_hexlattice" memory for the earlier designs
+//   this replaced, and why).
+import { buildMiniscordPokesearchCommand } from "./miniscord-pokesearch.js";
 
 // --- Self (commands page): hex-lattice of small circles ---------------
 
@@ -84,49 +84,22 @@ export function generateHexLattice({ centerLat, centerLon, radiusKm, rings }) {
  *   lattice spacing.
  */
 export function buildAreaScanCommand({ lat, lon, radiusKmText }) {
-  return `/pokesearch ${radiusKmText}km ${lat.toFixed(6)},${lon.toFixed(6)}`;
+  return buildMiniscordPokesearchCommand(`${radiusKmText}km`, `${lat.toFixed(6)},${lon.toFixed(6)}`);
 }
 
-// --- Subscriber ("cusuco") scans: dedicated second browser tab --------
+// --- Subscriber ("cusuco") scans: submitted through miniscord ---------
 
-// A subscriber's scan runs in a second, dedicated browser tab (switched to
-// via Ctrl+2, back via Ctrl+1 once done) instead of sharing the operator's
-// own normal tab - replacing an earlier design that reset the geofilter
-// via /pokeset commands there instead (see the
-// "project_scan_feature_v1_hexlattice" memory: those didn't always get
-// processed reliably). The whole action - switch, search, switch back -
-// is one single queued item on the AHK side (see worker-bridge/
-// http_send.ahk's RunTabSwitchSearch), so nothing else can interleave
-// mid-sequence or land in the wrong tab.
-//
-// Mirrors AhkConnector's own HOTKEY_PREFIX and http_send.ahk's
-// TABSEARCH_PREFIX/PART_SEPARATOR - duplicated rather than imported, since
-// core/ command-building modules stay free of any dependency on
-// connectors/, and the AHK side is a different language entirely. Must
-// stay in sync if either of those change.
-const TABSEARCH_PREFIX = "#TABSEARCH# ";
-const PART_SEPARATOR = "\x1f"; // ASCII Unit Separator - never appears in a coordinate/radius/dex-number command
-
-/**
- * Wraps `commandText` to run in the dedicated second tab: switch to it,
- * type and submit `commandText`. Deliberately does NOT switch back to the
- * first tab itself - worker-app.js's runAreaScan/runSpeciesScan queue that
- * separately (`ahkConnector.sendHotkeyImmediate("^1")`), only once they've
- * actually seen a reply (possibly after retrying this same call a couple
- * of times on an error reply first) - see http_send.ahk's
- * RunTabSwitchSearch/IsScanSafeItem for the AHK-side half. Safe only
- * because every value ever interpolated into
- * `commandText` by this file's own callers (coordinates, the fixed radius)
- * is already validated as plain digits/`.`/`,`/`-`/`:`/space - never reuse
- * this for less-controlled input without re-checking that (the
- * RunTabSwitchSearch side types it via SendText, so it's typed literally
- * regardless, but PART_SEPARATOR itself must never appear inside it).
- */
-export function wrapForSubscriberScanTab(commandText) {
-  return `${TABSEARCH_PREFIX}^2${PART_SEPARATOR}${commandText}`;
-}
+// A subscriber's scan is submitted through miniscord (see worker/
+// connectors/miniscord-connector.js) - a direct REST call to a Discord bot
+// integration - rather than typed into a browser tab. Earlier designs
+// tried resetting the operator's own tab's geofilter via /pokeset commands,
+// then a dedicated second browser tab switched to via AHK hotkeys; see the
+// "project_scan_feature_v1_hexlattice" memory for why each of those was
+// replaced. miniscord's own channel carries no ambient geofilter of its
+// own, so - same as those earlier designs - every command still has to
+// carry its own explicit location/radius.
 
 /** @param {{ lat: number, lon: number, radiusKmText: string }} point */
 export function buildSubscriberAreaScanCommand({ lat, lon, radiusKmText }) {
-  return wrapForSubscriberScanTab(`/pokesearch ${lat.toFixed(6)},${lon.toFixed(6)} ${radiusKmText}km`);
+  return buildMiniscordPokesearchCommand(`${lat.toFixed(6)},${lon.toFixed(6)}`, `${radiusKmText}km`);
 }

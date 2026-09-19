@@ -1,15 +1,17 @@
-// AutoHotKey output adapter - owns scheduling (runScheduledBatch/
-// checkDailyCommands) worker-side, so the Source Feed bridge only has to
+// AutoHotKey output adapter - owns daily-command scheduling
+// (#checkDailyCommands) and the bulk-scan priority mutex (used by
+// quest-scan/raid-scan) worker-side, so the Source Feed bridge only has to
 // relay a plain HTTP POST, never decide when. Sending itself is delegated
-// to an injected AhkTransport (see transports/ahk-transport.js).
+// to an injected AhkTransport (see transports/ahk-transport.js). Pokesearch
+// scheduling now lives in worker-app.js, sent through miniscord instead -
+// see that file's own miniscord-driven scheduled loop.
 //
 // A queued command is either typed text (default) or, if the string starts
 // with HOTKEY_PREFIX, a hotkey to press - see worker-bridge/http_send.ahk's PumpQueue for
 // the AHK-side half of that convention. Kept as a plain string prefix, not a
 // second endpoint/JSON wrapper, so it still rides the same single FIFO queue
-// as typed text: that's what guarantees a hotkey sent after some searches
-// (see sendHotkey/watch-channel-connector.js) can't jump ahead of one still
-// mid-type.
+// as typed text: that's what guarantees the Enter half of #sendDoubleEnter
+// can't jump ahead of the command it belongs to.
 const HOTKEY_PREFIX = "#HOTKEY# ";
 
 // Where scheduledSearches/dailyCommands are persisted once set via the
@@ -75,59 +77,43 @@ export class AhkConnector {
   #state;
   #getConfig;
   #ahkTransport;
-  #batchTimer = null;
   #dailyCheckTimer = null;
-  // start()/stop() only arm/disarm the *outer* timers - a batch or daily
-  // check already mid-loop (sleeping between queued sends) has no other way
-  // to notice it was disabled, so every loop below re-checks this flag
-  // before each send/continuation rather than relying on the timers alone.
+  // start()/stop() only arm/disarm the *outer* timer - a daily check
+  // already mid-loop (sleeping between queued sends) has no other way to
+  // notice it was disabled, so #checkDailyCommands re-checks this flag
+  // before each send/continuation rather than relying on the timer alone.
   #running = false;
-  // Serializes every AHK send across every caller - scheduled searches,
-  // daily commands, the dashboard's manual "send now", and the
-  // watch-channel priority scan/hotkey all funnel through #sendSerialized
-  // below, which chains onto this. #runScheduledBatch and #checkDailyCommands
-  // are two independent timers with no other coordination between them - a
-  // daily command's target time landing mid-batch used to mean both could
-  // queue into AHK around the same moment, and if a daily command (a real
-  // slash-command interaction, unlike a plain "/pokesearch ..." reply) needed
-  // longer than the batch's own inter-search pause to actually finish
-  // submitting, the next scheduled search would start typing into a compose
-  // box the daily command hadn't fully cleared yet. Routing every send
-  // through one chain, each followed by its own settle pause before the
-  // chain moves on, is what actually prevents that - not just AHK's own
+  // Serializes every AHK send across every caller - daily commands, the
+  // dashboard's manual "send now", and quest-scan/raid-scan's own
+  // runBulkScan all funnel through #sendSerialized below, which chains
+  // onto this. Each send is followed by
+  // its own settle pause before the chain moves on - not just AHK's own
   // one-at-a-time queue (see http_send.ahk's PumpQueue), which only
-  // guarantees ordering, not that Discord's UI had time to settle in between.
+  // guarantees ordering, not that Discord's UI had time to settle in
+  // between (see the incident #sendDoubleEnter's own comment describes for
+  // why that distinction matters).
   #sendChain = Promise.resolve();
   // Lazily loaded from workerMetadata (falling back to getConfig()'s
   // hardcoded defaults if nothing's ever been persisted) - see
   // #loadCommandsIfNeeded. Cached here once loaded so repeated calls (every
-  // #runScheduledBatch/#checkDailyCommands cycle) don't re-hit IndexedDB.
+  // #checkDailyCommands cycle, or worker-app.js's own miniscord-driven
+  // scheduled loop reading scheduledSearches) don't re-hit IndexedDB.
   #activeCommands = null;
-  // Bumped by #restartScheduledBatch whenever scheduledSearches actually
-  // changes - #runScheduledBatch checks this each iteration (same shape as
-  // the #running check) so an in-flight batch running the *old* list stops
-  // queuing further old items the moment a newer one starts, without
-  // disturbing whatever AHK send is already physically in flight.
-  #scheduledSearchesGeneration = 0;
   // Bulk-scan precedence gate (see runBulkScan) - resolved when no scan is
-  // running, pending for the scan's entire duration. #runScheduledBatch,
-  // #checkDailyCommands, and watch-channel-connector.js's #handleAlert all
-  // await this before sending anything, which is what actually gives a
-  // bulk scan priority over them: not by racing for the next #sendChain
-  // slot (the same race that corrupted compose boxes earlier in this
-  // file's history), but by nobody else even attempting to enqueue while
-  // it's pending. The scan's own sends don't wait on it - only everyone
-  // else does.
+  // running, pending for the scan's entire duration. #checkDailyCommands
+  // awaits this before sending anything, which is what actually gives a
+  // bulk scan priority over daily commands: not by racing for the next
+  // #sendChain slot (the same race that corrupted compose boxes earlier in
+  // this file's history), but by nobody else even attempting to enqueue
+  // while it's pending. The scan's own sends don't wait on it - only
+  // everyone else does.
   #bulkScanGate = Promise.resolve();
   #bulkScanActive = false;
   #bulkScanCancelRequested = false;
   // #checkDailyCommands can now block for as long as a bulk scan takes
   // (potentially much longer than its own 60s tick interval) - without
   // this, a second/third tick could stack up waiting on the same gate and
-  // all fire the same daily command once it clears. #runScheduledBatch
-  // doesn't need the equivalent: it's only ever re-entered via its own
-  // recursive setTimeout or #restartScheduledBatch, never an unconditional
-  // timer, so there's no way for two of its invocations to overlap.
+  // all fire the same daily command once it clears.
   #dailyCheckRunning = false;
 
   /**
@@ -144,13 +130,11 @@ export class AhkConnector {
 
   start() {
     this.#running = true;
-    this.#runScheduledBatch();
     this.#dailyCheckTimer = setInterval(() => this.#checkDailyCommands().catch((err) => this.#logger.error("ahk", err.message)), 60_000);
   }
 
   stop() {
     this.#running = false;
-    clearTimeout(this.#batchTimer);
     clearInterval(this.#dailyCheckTimer);
   }
 
@@ -173,14 +157,15 @@ export class AhkConnector {
 
   /**
    * Applies a new scheduledSearches/dailyCommands pair - called from the
-   * setAhkCommands RPC handler. Restarts the scheduled batch loop
-   * immediately, but only if scheduledSearches actually differs from what's
-   * currently active; a dailyCommands-only change is just persisted and
-   * picked up by #checkDailyCommands' own next 60s tick, no restart needed.
-   * Returns a plain {ok, ...} result rather than throwing - rpc.js's
-   * #dispatch collapses any thrown error into a generic "Internal error"
-   * message, which would hide a validation error's actual reason from the
-   * caller.
+   * setAhkCommands RPC handler. Both lists just get persisted here;
+   * scheduledSearches is read fresh at the start of each pass by
+   * worker-app.js's own miniscord-driven scheduled loop (no restart to
+   * trigger from this side any more - a change takes effect within that
+   * loop's own next pass, a few minutes out at most, same as
+   * dailyCommands already worked). Returns a plain {ok, ...} result rather
+   * than throwing - rpc.js's #dispatch collapses any thrown error into a
+   * generic "Internal error" message, which would hide a validation
+   * error's actual reason from the caller.
    */
   async applyCommands({ scheduledSearches, dailyCommands }) {
     const error = validateCommandsPayload({ scheduledSearches, dailyCommands });
@@ -193,28 +178,18 @@ export class AhkConnector {
     this.#activeCommands = { scheduledSearches, dailyCommands };
     await this.#state.workerMetadata.set(COMMANDS_METADATA_KEY, this.#activeCommands);
 
-    if (searchesChanged) {
-      this.#logger.info("ahk", `scheduled searches updated (${scheduledSearches.length} commands) - restarting the loop now`);
-      this.#restartScheduledBatch();
-    }
+    if (searchesChanged) this.#logger.info("ahk", `scheduled searches updated (${scheduledSearches.length} commands) - takes effect on the next pass`);
     if (dailyChanged) this.#logger.info("ahk", `daily commands updated (${dailyCommands.length} commands) - takes effect on the next check`);
     if (!searchesChanged && !dailyChanged) this.#logger.info("ahk", "commands saved - no actual change from what was already active");
 
     return { ok: true, scheduledSearches, dailyCommands };
   }
 
-  #restartScheduledBatch() {
-    this.#scheduledSearchesGeneration++;
-    clearTimeout(this.#batchTimer);
-    if (this.#running) this.#runScheduledBatch();
-  }
-
-  // Every AHK send funnels through here (scheduled searches, daily
-  // commands, the dashboard's manual "send now", the watch-channel priority
-  // scan, and the clear-unread hotkey) - logging both outcomes here, not
-  // just failures, is what makes the dashboard's activity log (see
-  // core/logging.js) a full audit trail of what was actually sent, not only
-  // what went wrong.
+  // Every AHK send funnels through here (daily commands, the dashboard's
+  // manual "send now", and quest-scan/raid-scan) - logging both outcomes
+  // here, not just failures, is what makes the dashboard's activity log
+  // (see core/logging.js) a full audit trail of what was actually sent,
+  // not only what went wrong.
   async #send(message) {
     const result = await this.#ahkTransport.send(message);
     const isHotkey = message.startsWith(HOTKEY_PREFIX);
@@ -230,12 +205,12 @@ export class AhkConnector {
    * pauses `pause` seconds before letting the chain move on - that pause is
    * what gives Discord's UI time to actually finish submitting/settling
    * before anything else touches the compose box. There is no way to skip
-   * it: an earlier version let the last message of a sendSequence call
-   * through with no pause on the theory that the caller's own next step
-   * (e.g. sendHotkey) would supply one - but the chain is shared with
-   * whatever unrelated caller (a scheduled search, a daily command) happens
-   * to be queued right behind it, which has no "own next step" to rely on,
-   * so that message fired with no settle time at all.
+   * it: an earlier version let a queued call's last message through with no
+   * pause on the theory that the caller's own next step would supply one -
+   * but the chain is shared with whatever unrelated
+   * caller (a daily command, quest-scan/raid-scan) happens to be queued
+   * right behind it, which has no "own next step" to rely on, so that
+   * message fired with no settle time at all.
    * @param {string} message
    * @param {{minS: number, maxS: number}} pause
    */
@@ -255,51 +230,14 @@ export class AhkConnector {
   }
 
   /**
-   * Sends `message` straight to AHK, bypassing #sendChain's usual
-   * serialization/settle-pause entirely - safe ONLY for a message that
-   * never touches the operator's own tab's compose box, since the entire
-   * reason #sendChain's trailing pause exists is to give *that* tab's UI
-   * time to visually settle before the next command types into it (see
-   * #sendSerialized's own comment) - a concern that doesn't apply to
-   * something that types into the dedicated second tab instead, or that
-   * only changes focus and never types anything at all. AHK's own
-   * PumpQueue/`busy` flag (see worker-bridge/http_send.ahk) still
-   * guarantees this can't execute concurrently with whatever's already
-   * mid-flight there, so the only thing skipped here is the *extra*
-   * wall-clock wait the normal schedule needs but this doesn't.
-   *
-   * Used by worker-app.js's runSubscriberScan for a subscriber scan's own
-   * TABSEARCH send and its final switch-back hotkey (see sendHotkeyImmediate
-   * below) - confirmed live that a scan's own command could otherwise sit
-   * behind a scheduled search's full 8-15s settle pause before even being
-   * queued, adding many seconds of pure wait the viewer has no way to
-   * distinguish from the scan actually taking that long.
-   *
-   * NEEDS LIVE VERIFICATION before this is trusted beyond that one caller:
-   * switching away from the operator's own tab while Discord's UI there
-   * hasn't finished visually settling (not AHK's own execution, which is
-   * already serialized) is untested from here - confirm it doesn't cause
-   * any glitch in the real browser before relying on it elsewhere.
-   */
-  async sendImmediate(message) {
-    await this.#send(message);
-  }
-
-  /** Same as sendImmediate, but for a hotkey press (see sendHotkey's own HOTKEY_PREFIX convention). */
-  async sendHotkeyImmediate(spec) {
-    await this.#send(`${HOTKEY_PREFIX}${spec}`);
-  }
-
-  /**
    * Sends `message` and a separate {Enter} hotkey press back-to-back - some
    * real Discord slash commands need Enter pressed twice (the first only
    * accepts the autocomplete/subcommand selection, it doesn't submit). Both
    * #sendSerialized calls MUST be issued here with no `await` between them:
-   * otherwise some other queued sender (a scheduled search, another daily
-   * command) could grab the chain slot between the command and its second
-   * Enter - see #sendChain's own comment for the incident that first
-   * surfaced this, and watch-channel-connector.js's #handleAlert for the
-   * same reasoning applied to a hotkey+sequence pair instead.
+   * otherwise some other queued sender (another daily command,
+   * quest-scan/raid-scan) could grab the chain slot between the command and
+   * its second Enter - see #sendChain's own comment for the incident that
+   * first surfaced this.
    *
    * The two sends get *different* pauses, not `pause` twice: the first only
    * needs to be long enough for Discord's own UI to register the typed
@@ -315,53 +253,6 @@ export class AhkConnector {
     const commandSend = this.#sendSerialized(message, CONFIRM_ENTER_GAP);
     const enterSend = this.#sendSerialized(`${HOTKEY_PREFIX}{Enter}`, pause);
     return Promise.all([commandSend, enterSend]);
-  }
-
-  /**
-   * Sends a list of messages back-to-back, pacing between them - used for
-   * the watch-channel connector's out-of-schedule "scan now" (see
-   * watch-channel-connector.js). Everything here still goes through the
-   * same #sendChain as scheduled searches/daily commands, so it naturally
-   * waits its turn behind whichever of those (if any) is already mid-send,
-   * rather than needing its own separate "is something else busy" check -
-   * which is also why the *last* message here still gets the pause, not
-   * just the ones in between: skipping it once let a scheduled search that
-   * happened to be queued right behind this call fire immediately after,
-   * with no settle time, the same bug this chain exists to prevent (just
-   * moved to a different pair of messages - see #sendChain's own comment).
-   * @param {string[]} messages
-   * @param {{minS: number, maxS: number}} pause
-   */
-  async sendSequence(messages, pause) {
-    for (const message of messages) {
-      if (!this.#running) return;
-      await this.#sendSerialized(message, pause);
-    }
-  }
-
-  /**
-   * Presses a hotkey rather than typing text - see HOTKEY_PREFIX above and
-   * worker-bridge/http_send.ahk's PumpQueue. `spec` is AHK Send-command key
-   * notation, e.g. "+{Escape}" for Shift+Esc.
-   */
-  async sendHotkey(spec) {
-    const { priorityScanPauseMinS, priorityScanPauseMaxS } = this.#getConfig();
-    await this.#sendSerialized(`${HOTKEY_PREFIX}${spec}`, { minS: priorityScanPauseMinS, maxS: priorityScanPauseMaxS });
-  }
-
-  async #runScheduledBatch() {
-    const generation = this.#scheduledSearchesGeneration;
-    const config = this.#getConfig();
-    const { scheduledSearches } = await this.#loadCommandsIfNeeded();
-    for (const message of scheduledSearches) {
-      if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
-      await this.#bulkScanGate;
-      if (!this.#running || generation !== this.#scheduledSearchesGeneration) return; // re-check - a scan may have run for a while
-      await this.#sendSerialized(message, { minS: config.searchPauseMinS, maxS: config.searchPauseMaxS });
-    }
-    if (!this.#running || generation !== this.#scheduledSearchesGeneration) return;
-    const restMs = randomInt(config.batchRestMinMin, config.batchRestMaxMin) * 60_000;
-    this.#batchTimer = setTimeout(() => this.#runScheduledBatch(), restMs);
   }
 
   async #checkDailyCommands() {
@@ -408,15 +299,6 @@ export class AhkConnector {
     }
   }
 
-  /** For watch-channel-connector.js's #handleAlert - see #bulkScanGate. */
-  async waitForBulkScanClear() {
-    await this.#bulkScanGate;
-  }
-
-  isBulkScanActive() {
-    return this.#bulkScanActive;
-  }
-
   /** No-op if no scan is currently running. Checked between commands, not mid-send - see runBulkScan. */
   cancelBulkScan() {
     if (this.#bulkScanActive) this.#bulkScanCancelRequested = true;
@@ -427,9 +309,8 @@ export class AhkConnector {
    * `buildRowCommands(location)` in sequence with the normal search pause -
    * used for the dashboard's quest-scan/raid-scan sections (see
    * worker/core/scan-groups.js and worker-app.js). Takes exclusive priority
-   * over the scheduled batch, daily commands, and the watch-channel
-   * priority scan for its entire duration (see #bulkScanGate); only one
-   * bulk scan, of either kind, can run at a time.
+   * over daily commands for its entire duration (see #bulkScanGate); only
+   * one bulk scan, of either kind, can run at a time.
    * @param {object[]} locations
    * @param {(location: object) => string[]} buildRowCommands
    * @param {(sent: number, total: number) => void} [onProgress]
@@ -484,41 +365,5 @@ export class AhkConnector {
       this.#bulkScanGate = Promise.resolve();
     }
     return { sent, total, cancelled };
-  }
-
-  /**
-   * Acquires the bulk-scan priority mutex without sending anything itself -
-   * for a caller whose own send sequence is conditional/variable rather
-   * than runBulkScan's fixed list-of-locations shape. Used by
-   * worker-app.js's runAreaScan/runSpeciesScan for a subscriber's scan:
-   * retry the same search a couple of times on an error reply, then switch
-   * back to the operator's own tab only once a real reply has actually been
-   * seen (or retries are exhausted) - genuinely can't be expressed as a
-   * fixed command list decided up front. Holding this mutex for that whole
-   * span is what guarantees nothing else (the scheduled loop, a daily
-   * command, another scan) can be sent while it's waiting, exactly like
-   * runBulkScan's own guarantee for its fixed-list callers.
-   * Throws the same "A scan is already running." as runBulkScan if one is
-   * already active.
-   * @returns {() => void} releases the mutex - MUST be called exactly once,
-   *   from a finally, same as runBulkScan's own.
-   */
-  beginBulkScan() {
-    if (this.#bulkScanActive) throw new Error("A scan is already running.");
-    this.#bulkScanActive = true;
-    this.#bulkScanCancelRequested = false;
-    let releaseGate;
-    this.#bulkScanGate = new Promise((resolve) => {
-      releaseGate = resolve;
-    });
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.#bulkScanActive = false;
-      this.#bulkScanCancelRequested = false;
-      releaseGate();
-      this.#bulkScanGate = Promise.resolve();
-    };
   }
 }

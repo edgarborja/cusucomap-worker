@@ -46,15 +46,14 @@ const MIN_REMAINING_MS_TO_NOTIFY = 5 * 60_000;
 // results spanned - a /pokesearch reply over 4 results continues into a
 // second, headerless message) arrive at the worker in a tight cluster;
 // spawns from a *different* command are always separated by at least the
-// shortest settle pause this connector ever uses (the watch-channel's
-// priority scan, 3s minimum - see ahk-connector.js's priorityScanPauseMinS)
-// plus scrape/network latency. Debouncing spawn.created on a window
-// shorter than that pacing floor is what groups "one command's results"
-// into one notification without needing to correlate against
-// ahk.command-sent directly (which races: that event also fires for the
-// clear-unread hotkey immediately after a priority scan, before its own
-// reply may have even been scraped yet). MAX_WAIT bounds a batch that
-// somehow never goes quiet (continuous activity) to a hard ceiling.
+// shortest inter-command settle pause AHK still uses (see
+// ahk-connector.js's searchPauseMinS - only daily commands and
+// quest-scan/raid-scan send through AHK at all now, pokesearch having
+// moved to miniscord) plus scrape/network latency. Debouncing
+// spawn.created on a window shorter than that pacing floor is what groups
+// "one command's results" into one notification without needing to
+// correlate against ahk.command-sent directly. MAX_WAIT bounds a batch
+// that somehow never goes quiet (continuous activity) to a hard ceiling.
 const BATCH_DEBOUNCE_MS = 2_000;
 const BATCH_MAX_WAIT_MS = 6_000;
 // How many individual spawns to name in a combined notification's body

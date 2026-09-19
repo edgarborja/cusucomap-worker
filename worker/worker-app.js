@@ -13,14 +13,18 @@ import { TampermonkeyPushTransport } from "./transports/push-transport.js";
 import { AhkTransport } from "./transports/ahk-transport.js";
 import { SourceFeedConnector } from "./connectors/source-feed-connector.js";
 import { AhkConnector } from "./connectors/ahk-connector.js";
+import { MiniscordConnector } from "./connectors/miniscord-connector.js";
 import { WatchChannelConnector } from "./connectors/watch-channel-connector.js";
+import { buildSpawnFromMiniscordRecord } from "./core/miniscord-spawn.js";
+import { buildMiniscordPokesearchCommand } from "./core/miniscord-pokesearch.js";
+import { buildRaidFromGym, gymLocationKey } from "./core/miniscord-gym.js";
 import { PokemonStateService } from "./services/pokemon-state.js";
 import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
 import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
 import { generateHexLattice, buildAreaScanCommand, buildSubscriberAreaScanCommand } from "./core/area-scan.js";
-import { isValidDexNumber, buildSpeciesScanCommand, buildSubscriberSpeciesScanCommand } from "./core/species-scan.js";
+import { isValidDexNumber, buildSpeciesScanCommand } from "./core/species-scan.js";
 import { exportAllData } from "./storage/indexeddb.js";
 import { crc16Tag } from "../shared/crc16.js";
 import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from "../shared/nostr-protocol.js";
@@ -85,18 +89,12 @@ const AHK_ENABLE_GRACE_MS = 5_000;
  * clipboard-paste path did. Clicking again during the countdown cancels it.
  * @returns {{ isEnabled: () => boolean, enableThenRun: (syncCallback: () => unknown) => Promise<unknown> }}
  */
-function wireAhkControls({ ahkConnector, logger, getConfig }) {
+function wireAhkControls({ ahkConnector, logger }) {
   const toggleButton = document.getElementById("ahk-toggle");
   const statusEl = document.getElementById("ahk-status");
   let enabled = false;
   let countdownTimer = null;
   let cancelCurrentEnable = null;
-  // Only the very first enable of this page load sends the geofilter
-  // safety-net reset (see defaultAhkConfig's own comment on
-  // defaultGeofilterCommand) - a later disable/re-enable within the same
-  // session isn't the "worker got interrupted mid-scan" case this exists
-  // for, so it shouldn't re-fire every time.
-  let startupGeofilterResetSent = false;
 
   function setDisabled() {
     clearTimeout(countdownTimer);
@@ -113,14 +111,14 @@ function wireAhkControls({ ahkConnector, logger, getConfig }) {
    * Enables AHK if it isn't already (running the same grace-period
    * countdown as before), then calls `syncCallback` and resolves/rejects
    * with its result - used directly by the toggle button (with a no-op
-   * callback) and by the bulk-scan buttons (see wireBulkScanSection),
-   * which need their scan to claim priority the instant AHK starts rather
-   * than race the scheduled batch for it. That guarantee is *why*
-   * `syncCallback` is invoked synchronously, in the same tick as
-   * ahkConnector.start(), rather than via a caller separately awaiting a
-   * resolved promise and calling it after - going through even one extra
-   * `await` before calling it would leave a window for #runScheduledBatch's
-   * own already-suspended continuation to run first (see
+   * callback) and by the quest-scan/raid-scan bulk-scan buttons (see
+   * wireBulkScanSection), which need their scan to claim priority the
+   * instant AHK starts rather than race anything else queuing onto its
+   * chain for it. That guarantee is *why* `syncCallback` is invoked
+   * synchronously, in the same tick as ahkConnector.start(), rather than
+   * via a caller separately awaiting a resolved promise and calling it
+   * after - going through even one extra `await` before calling it would
+   * leave a window for something else to queue first (see
    * AhkConnector#runBulkScan's own "no await gap" reasoning for the same
    * class of bug, fixed the same way here).
    * @param {() => unknown} syncCallback
@@ -149,18 +147,7 @@ function wireAhkControls({ ahkConnector, logger, getConfig }) {
           ahkConnector.start();
           toggleButton.textContent = "Disable AHK";
           statusEl.textContent = "Enabled";
-          logger.info("ahk", "AHK enabled - sending scheduled/daily/manual commands.");
-          if (!startupGeofilterResetSent) {
-            startupGeofilterResetSent = true;
-            // Not awaited - same "no await gap before syncCallback" reasoning
-            // as this function's own doc comment above: sendCustomCommand
-            // still queues onto the same #sendChain as syncCallback's own
-            // first send (e.g. an area scan's beforeCommand), so ordering
-            // between the two is preserved without blocking this tick.
-            ahkConnector
-              .sendCustomCommand(getConfig().defaultGeofilterCommand)
-              .catch((err) => logger.error("ahk", `startup geofilter reset failed: ${err.message}`));
-          }
+          logger.info("ahk", "AHK enabled - sending daily/manual commands and quest-scan/raid-scan.");
           resolve(syncCallback());
           return;
         }
@@ -220,7 +207,7 @@ function wireBulkScanSection(id, buildRowCommands, { ahkConnector, ahkControls, 
       return;
     }
     const enableNotice = ahkControls.isEnabled() ? "" : " AHK is currently disabled, so this will enable it first (same 5s grace period as the toggle button).";
-    if (!confirm(`Start a scan over ${groups.length} groups? This takes priority over the scheduled loop and hundo detection until it finishes.${enableNotice}`)) return;
+    if (!confirm(`Start a scan over ${groups.length} groups? This takes priority over daily commands and the watch-channel's clear-unread hotkey until it finishes.${enableNotice}`)) return;
 
     startButton.hidden = true;
     cancelButton.hidden = false;
@@ -287,42 +274,171 @@ async function startWorker(publicConfig, secretConfig) {
   const pokemonState = new PokemonStateService({ state, bus, logger });
   pokemonState.start();
 
-  // Set only for the duration of a subscriber-requested scan's own
-  // bulk-scan-priority window (see runAreaScan below and
-  // source-feed-connector.js's #emitSpawn) - null otherwise, including for
-  // the operator's own (self) scans.
-  let activeScanId = null;
-
   const sourceFeedConnector = new SourceFeedConnector({
     bus,
     logger,
     state,
     getGeofilterAnchor: () => publicConfig.geofilterAnchor,
-    // The scan channel must actually be scraped too, or a subscriber's own
-    // scan replies would never reach the worker at all - deduped in case
-    // the operator also happens to list it among the general channels.
-    getTrackedChannelIds: () => [...new Set([...publicConfig.trackedChannelIds, ...(publicConfig.scanChannelId ? [publicConfig.scanChannelId] : [])])],
-    getScanChannelId: () => publicConfig.scanChannelId,
-    getActiveScanId: () => activeScanId,
+    getTrackedChannelIds: () => publicConfig.trackedChannelIds,
   });
   sourceFeedConnector.start();
 
   const ahkTransport = new AhkTransport();
   const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: defaultAhkConfig, ahkTransport });
-  const ahkControls = wireAhkControls({ ahkConnector, logger, getConfig: defaultAhkConfig });
+  const ahkControls = wireAhkControls({ ahkConnector, logger });
+
+  // Replaces AHK/the browser/Tampermonkey for every pokesearch command -
+  // scheduled searches, the watch-channel's special search, and both the
+  // operator's own (self) and a subscriber's area/species scan - see
+  // worker/connectors/miniscord-connector.js and the
+  // "project_scan_feature_v1_hexlattice" memory for the earlier
+  // dedicated-second-tab design this superseded. Daily commands and
+  // quest-scan/raid-scan still go through AHK - miniscord has no
+  // equivalent endpoint for those yet.
+  const miniscordConnector = new MiniscordConnector({ getBaseUrl: () => publicConfig.miniscordUrl, logger });
+  // Same cache backing (and key prefix) as source-feed-connector.js's own
+  // speciesCache - shares resolved PokeAPI lookups across both paths
+  // rather than each maintaining an independent copy.
+  const speciesCache = {
+    get: (key) => state.workerMetadata.get(`speciesResolverCache:${key}`, null),
+    set: (key, value) => state.workerMetadata.set(`speciesResolverCache:${key}`, value),
+  };
+
+  // Inclusive on both ends - mirrors AhkConnector's own private helper of
+  // the same name, used the same way (jittering a rest interval).
+  function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  // Reassigned once watchChannelConnector is constructed below - a plain
+  // mutable binding rather than depending on hoisting/declaration order,
+  // since runOrganicMiniscordSearch is defined (though not yet called)
+  // before that point. See WatchChannelConnector#notifyMiniscordActivity
+  // for why piggybacking here matters: it's what lets a new watch-channel
+  // message get noticed sooner than its own 15s fallback poll.
+  let notifyWatchChannelActivity = () => {};
+
+  /**
+   * Runs one miniscord search and publishes whatever it finds the normal,
+   * organic way - the shared "just search and make the results public"
+   * primitive behind the scheduled loop, the watch-channel's own special
+   * search, and the operator's own self area/species scans. Never retries;
+   * a caller that cares whether this actually got a reply can check the
+   * returned result's own `ok` field.
+   * @param {string} command
+   * @returns {Promise<{ok:true, results:object[]} | {ok:false, error:string}>}
+   */
+  async function runOrganicMiniscordSearch(command) {
+    const result = await miniscordConnector.search(command);
+    notifyWatchChannelActivity();
+    if (!result.ok) return result;
+    const built = await Promise.all(result.results.map((record) => buildSpawnFromMiniscordRecord(record, speciesCache)));
+    for (const spawn of built.filter(Boolean)) bus.emit("spawn.observed", spawn);
+    return result;
+  }
+
+  // A scheduledSearches entry is a full command string (e.g.
+  // "/pokesearch iv100") - this strips the "/pokesearch " prefix back off
+  // so the bare filter text can be recombined with an explicit
+  // center/radius via buildMiniscordPokesearchCommand instead.
+  function stripPokesearchPrefix(command) {
+    return command.replace(/^\/pokesearch\s+/, "");
+  }
+
+  // Runs scheduledSearches (see AhkConnector#getCommands - still the
+  // admin-edited source of truth, just no longer sent via AHK) through
+  // miniscord one at a time, resting batchRestMinMin/MaxMin minutes
+  // between full passes - mirrors AhkConnector's own former
+  // #runScheduledBatch shape, just a different transport. Runs
+  // independently of the "Enable AHK" toggle - it never touches AHK.
+  let scheduledLoopGeneration = 0;
+  async function runMiniscordScheduledBatch(generation) {
+    if (miniscordConnector.isConfigured()) {
+      const { scheduledSearches } = await ahkConnector.getCommands();
+      const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultAhkConfig();
+      for (const entry of scheduledSearches) {
+        if (generation !== scheduledLoopGeneration) return;
+        const command = buildMiniscordPokesearchCommand(
+          stripPokesearchPrefix(entry),
+          `${defaultSearchCenterLat.toFixed(6)},${defaultSearchCenterLon.toFixed(6)}`,
+          `${defaultSearchRadiusKmText}km`
+        );
+        const result = await runOrganicMiniscordSearch(command);
+        if (!result.ok) logger.warn("miniscord", `scheduled search "${entry}" failed: ${result.error}`);
+      }
+    }
+    if (generation !== scheduledLoopGeneration) return;
+    const { batchRestMinMin, batchRestMaxMin } = defaultAhkConfig();
+    setTimeout(() => runMiniscordScheduledBatch(generation), randomInt(batchRestMinMin, batchRestMaxMin) * 60_000);
+  }
+  runMiniscordScheduledBatch(scheduledLoopGeneration);
+
+  // Polls miniscord's GET /gyms cache and publishes every gym currently
+  // hosting a raid with a known boss - see core/miniscord-gym.js for what
+  // gets skipped (no active raid, an unhatched egg, an unrevealed
+  // mega-tier boss) and why. 5 minutes matches miniscord's own background
+  // refresh cadence (see its docs) - polling faster would only re-read the
+  // same cached snapshot. Independent of the scheduled/priority-scan
+  // pacing above: GET /gyms never touches Discord, so there's no shared
+  // cooldown to respect here.
+  //
+  // gymNameByLocation backs the one-time include_name=true request below:
+  // per miniscord's own docs, that flag permanently flips a service-wide
+  // switch (not a per-request one), so it's requested at most once here
+  // (only until it actually succeeds) rather than on every poll - a name
+  // seen that way is remembered here (keyed the same way
+  // miniscord-gym.js's own stable id is, so they always agree on which
+  // gym a lat/lon means) and reused as a fallback on any later poll whose
+  // own gym.name briefly comes back null (the background poller can take
+  // up to 5 minutes to catch up after the switch flips).
+  const GYM_POLL_INTERVAL_MS = 5 * 60_000;
+  const gymNameByLocation = new Map();
+  let gymNamesRequested = false;
+  async function runMiniscordGymPoll() {
+    if (miniscordConnector.isConfigured()) {
+      const result = await miniscordConnector.getGyms({ includeName: !gymNamesRequested });
+      notifyWatchChannelActivity();
+      if (result.ok) {
+        gymNamesRequested = true;
+        for (const gym of result.results) {
+          if (gym.name) gymNameByLocation.set(gymLocationKey(gym.location.lat, gym.location.lon), gym.name);
+        }
+        const built = await Promise.all(result.results.map((gym) => buildRaidFromGym(gym, speciesCache, gymNameByLocation)));
+        for (const raid of built.filter(Boolean)) bus.emit("raid.observed", raid);
+      } else {
+        logger.warn("miniscord", `gym poll failed: ${result.error}`);
+      }
+    }
+    setTimeout(runMiniscordGymPoll, GYM_POLL_INTERVAL_MS);
+  }
+  runMiniscordGymPoll();
+
+  // Fixed center/radius/filter for the watch channel's own special
+  // pokesearch (see WatchChannelConnector) - the lat/lon deliberately
+  // reuses the tracked channel's own geofilterAnchor (the same point the
+  // real /geofilter command was set to), not defaultSearchCenterLat/Lon,
+  // which is a separate, general-purpose default for the scheduled loop.
+  const WATCH_CHANNEL_SEARCH_RADIUS = "10km";
+  const WATCH_CHANNEL_SEARCH_FILTER = "iv100";
 
   const watchChannelConnector = new WatchChannelConnector({
-    bus,
     logger,
     getWatchChannelName: () => publicConfig.watchChannelName,
-    getPriorityScanConfig: () => {
-      const config = defaultAhkConfig();
-      return { messages: config.priorityScanMessages, pause: { minS: config.priorityScanPauseMinS, maxS: config.priorityScanPauseMaxS } };
+    miniscordConnector,
+    runSpecialSearch: () =>
+      runOrganicMiniscordSearch(
+        buildMiniscordPokesearchCommand(
+          `${publicConfig.geofilterAnchor.lat},${publicConfig.geofilterAnchor.lon}`,
+          WATCH_CHANNEL_SEARCH_RADIUS,
+          WATCH_CHANNEL_SEARCH_FILTER
+        )
+      ),
+    lastSeenMessageIdCache: {
+      get: () => state.workerMetadata.get("watchChannelLastSeenMessageId", null),
+      set: (id) => state.workerMetadata.set("watchChannelLastSeenMessageId", id),
     },
-    getClearUnreadHotkey: () => defaultAhkConfig().clearUnreadHotkey,
-    ahkConnector,
-    isAhkEnabled: ahkControls.isEnabled,
   });
+  notifyWatchChannelActivity = () => watchChannelConnector.notifyMiniscordActivity();
   watchChannelConnector.start();
 
   wireBulkScanSection("quest-scan", buildQuestGroupCommands, { ahkConnector, ahkControls, logger });
@@ -411,75 +527,21 @@ async function startWorker(publicConfig, secretConfig) {
   }
 
   // A subscriber's scan retries its own single search this many additional
-  // times (so up to this + 1 total attempts) on a bot-error/no-reply
-  // outcome before giving up - confirmed live: a real Discord "The
-  // application did not respond" error, with no way to know in advance
-  // whether a retry would succeed.
-  const SCAN_MAX_RETRIES = 2;
-  // How long one attempt waits for a definitive signal (a result, an
-  // explicit "no results" ack, or a bot-error reply) before being treated
-  // as failed. This has to cover more than just Discord's own reply
-  // latency: sendImmediate's own await only resolves once AHK has
-  // acknowledged *queuing* the command, well before it's actually typed -
-  // AHK responds instantly and only then switches tabs, settles, and types
-  // it character by character (see http_send.ahk's RunTabSwitchSearch),
-  // all of which eats into this budget before Enter is even pressed. There
-  // is no signal at all, today, for exactly when that happens - AHK never
-  // reports back once a command is actually submitted, only that it was
-  // queued - so this has to be generous enough to absorb that dispatch
-  // overhead *and* Discord's own reply latency *and* the bridge's own
-  // scrape/detection latency on top of that. Confirmed live: a genuinely
-  // successful reply that simply hadn't been detected by the bridge yet
-  // triggered a false-timeout retry at the old, shorter value.
-  const SCAN_REPLY_TIMEOUT_MS = 25_000;
-  // Once at least one result has arrived for an attempt, how much longer to
-  // wait with nothing further before considering that reply fully received
-  // - a /pokesearch reply split across multiple Discord messages arrives as
-  // a tight burst (confirmed live: well under 500ms between messages, though
-  // one observed gap ran to ~1.5s), so this only needs a modest cushion
-  // over that, not anywhere near the full reply-timeout above.
-  const SCAN_REPLY_QUIET_MS = 2000;
+  // times (so up to this + 1 total attempts) on a miniscord failure before
+  // giving up - miniscord itself makes exactly one attempt per call and
+  // never retries internally (confirmed in its own docs), so retry policy
+  // is entirely this worker's concern, same as it was for the old
+  // AHK-based path.
+  const MINISCORD_SCAN_MAX_RETRIES = 2;
   // Pause before retrying a failed attempt - not trying to look human like
   // the search-pacing pauses elsewhere, just not hammering Discord with the
-  // exact same command back-to-back after it just failed.
-  const SCAN_RETRY_PAUSE_MS = 3000;
+  // exact same command back-to-back after it just failed. On top of
+  // MiniscordConnector's own MIN_GAP_MS, which already paces every call
+  // regardless of caller.
+  const MINISCORD_SCAN_RETRY_PAUSE_MS = 3000;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Waits for `scanId`'s current search attempt to settle, using the
-   * scanReply.observed events source-feed-connector.js emits while
-   * activeScanId is set (see that file's #emitSpawn/#handleMessage).
-   * Resolves "ok" once either an explicit no-results ack arrives, or at
-   * least one result arrives and then SCAN_REPLY_QUIET_MS passes with
-   * nothing further. Resolves "error" the moment a bot-error reply arrives,
-   * or if nothing at all arrives within SCAN_REPLY_TIMEOUT_MS.
-   */
-  function waitForScanReply(scanId) {
-    return new Promise((resolve) => {
-      let settled = false;
-      let quietTimer = null;
-      const finish = (outcome) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(quietTimer);
-        clearTimeout(hardTimer);
-        unsubscribe();
-        resolve(outcome);
-      };
-      const hardTimer = setTimeout(() => finish("error"), SCAN_REPLY_TIMEOUT_MS);
-      const unsubscribe = bus.on("scanReply.observed", (evt) => {
-        if (evt.scanId !== scanId) return;
-        if (evt.kind === "error") finish("error");
-        else if (evt.kind === "empty") finish("ok");
-        else {
-          clearTimeout(quietTimer);
-          quietTimer = setTimeout(() => finish("ok"), SCAN_REPLY_QUIET_MS);
-        }
-      });
-    });
   }
 
   // Reverses authorizeScanRequest's charge - a scan that never got a usable
@@ -494,38 +556,17 @@ async function startWorker(publicConfig, secretConfig) {
   }
 
   /**
-   * Runs a subscriber's single-search scan (area or species) end to end:
-   * acquires bulk-scan priority, sends the search in the dedicated second
-   * tab, waits for it to actually settle (see waitForScanReply) - retrying
-   * up to SCAN_MAX_RETRIES times on a bot-error/no-reply outcome - then
-   * switches back to the operator's own tab, all still inside the same
-   * priority window (AhkConnector#beginBulkScan), so nothing else (the
-   * scheduled loop, a daily command, another scan) can be sent while this
-   * waits.
-   *
-   * Replaces an earlier version that cleared activeScanId and switched
-   * tabs back immediately once the search was merely *sent*, with no idea
-   * whether it had actually gotten a reply - confirmed live to both leak a
-   * multi-message reply's continuation messages into the public feed (see
-   * the "project_scan_feature_v1_hexlattice" memory) and, worse, to
-   * occasionally leave activeScanId set long enough for an unrelated
-   * scheduled search's own results to be swept into the pool instead (a
-   * race between that fix's own pre-send hook registration and the
-   * scheduled loop's own gate-release continuation, both kicked off by the
-   * same event but not ordered relative to each other). Holding this
-   * mutex for the whole wait - not just the send - removes the race
-   * entirely: nothing else can be sent until *after* activeScanId has
-   * already been cleared below.
-   *
-   * Sends via AhkConnector#sendImmediate/#sendHotkeyImmediate, not
-   * sendCustomCommand/sendHotkey - a scan's own command types into the
-   * dedicated second tab, never the operator's own, so it doesn't need to
-   * wait behind #sendChain's usual settle pause the way a normal scheduled
-   * search does (see sendImmediate's own doc comment for why that's safe,
-   * and its "needs live verification" caveat). Confirmed live this pause
-   * could otherwise stack up to several extra seconds of pure wait onto a
-   * scan's own reply latency, with no way for a caller polling
-   * getScanResults to tell that apart from the scan itself taking that long.
+   * Runs a subscriber's single-search scan (area or species) end to end via
+   * miniscord: one HTTP call per attempt, retrying up to
+   * MINISCORD_SCAN_MAX_RETRIES times on failure, then writing results
+   * straight into the pool. No dedicated tab, no wait-for-event machinery,
+   * no bulk-scan mutex needed - miniscord's response IS the complete,
+   * unambiguous answer to this exact call, so there's nothing left to
+   * attribute after the fact the way the old DOM-scraped/dedicated-tab
+   * design needed extensive machinery for (see the
+   * "project_scan_feature_v1_hexlattice" memory for that history).
+   * Doesn't touch AHK at all, so it runs independently of whether AHK is
+   * enabled/disabled and never contends with its own scheduling.
    *
    * On exhausted retries: reimburses the caller's cusuco and marks the pool
    * "failed" rather than leaving it looking like a genuine zero-result scan
@@ -536,40 +577,50 @@ async function startWorker(publicConfig, secretConfig) {
    *   command text itself never changes between retries.
    * @returns {Promise<"ok"|"error">}
    */
-  async function runSubscriberScan(scanId, fromPubkey, buildCommand) {
-    const release = ahkConnector.beginBulkScan();
-    try {
-      let outcome = "error";
-      for (let attempt = 0; attempt <= SCAN_MAX_RETRIES; attempt++) {
-        if (attempt > 0) {
-          logger.warn("worker", `scan ${scanId} attempt ${attempt + 1}/${SCAN_MAX_RETRIES + 1} - retrying after a bot error/no reply`);
-          await sleep(SCAN_RETRY_PAUSE_MS);
-        }
-        // waitForScanReply's own timeout starts only once sendImmediate's
-        // own await resolves - i.e. once AHK has actually queued the
-        // command, not from whenever this loop iteration merely began.
-        await ahkConnector.sendImmediate(buildCommand()).catch((err) => logger.error("ahk", `scan send failed: ${err.message}`));
-        outcome = await waitForScanReply(scanId);
-        if (outcome === "ok") break;
+  async function runSubscriberScanViaMiniscord(scanId, fromPubkey, buildCommand) {
+    let records = null;
+    for (let attempt = 0; attempt <= MINISCORD_SCAN_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        logger.warn("worker", `scan ${scanId} attempt ${attempt + 1}/${MINISCORD_SCAN_MAX_RETRIES + 1} - retrying after a miniscord failure`);
+        await sleep(MINISCORD_SCAN_RETRY_PAUSE_MS);
       }
-
-      activeScanId = null;
-      if (outcome === "ok") {
-        await state.pendingScanPools.markCollectingAsPending(scanId);
-        const pool = await state.pendingScanPools.get(scanId);
-        logger.info("worker", `scan ${scanId} status: collecting -> pending (${pool?.spawns.length ?? 0} spawn(s))`);
-      } else {
-        logger.warn("worker", `scan ${scanId} got no usable reply after ${SCAN_MAX_RETRIES + 1} attempts - reimbursing cusuco`);
-        await reimburseScanRequest(fromPubkey);
-        const pool = await state.pendingScanPools.get(scanId);
-        if (pool) await state.pendingScanPools.put({ ...pool, status: "failed" });
-        logger.info("worker", `scan ${scanId} status: collecting -> failed`);
+      const result = await miniscordConnector.search(buildCommand());
+      if (result.ok) {
+        records = result.results;
+        break;
       }
-      await ahkConnector.sendHotkeyImmediate("^1");
-      return outcome;
-    } finally {
-      release();
     }
+
+    if (records === null) {
+      logger.warn("worker", `scan ${scanId} got no usable reply after ${MINISCORD_SCAN_MAX_RETRIES + 1} attempts - reimbursing cusuco`);
+      await reimburseScanRequest(fromPubkey);
+      const pool = await state.pendingScanPools.get(scanId);
+      if (pool) await state.pendingScanPools.put({ ...pool, status: "failed" });
+      logger.info("worker", `scan ${scanId} status: collecting -> failed`);
+      return "error";
+    }
+
+    const built = await Promise.all(records.map((record) => buildSpawnFromMiniscordRecord(record, speciesCache)));
+    const spawns = built.filter(Boolean);
+    if (spawns.length < built.length) {
+      logger.warn("worker", `scan ${scanId}: ${built.length - spawns.length} miniscord record(s) had no location/despawnAt - skipped`);
+    }
+    // Same "already publicly known" skip the old DOM-scraped path applied -
+    // a subscriber shouldn't get credit for something already on the map
+    // (see stableIntId/stableSpawnKey's own comment on why the same
+    // real-world spawn always produces the same id regardless of which
+    // search turned it up).
+    const newSpawns = [];
+    for (const spawn of spawns) {
+      const existing = await state.spawns.get(spawn.id);
+      const alreadyKnown = Boolean(existing) && existing.status === "active" && new Date(existing.despawnAt).getTime() > Date.now();
+      if (!alreadyKnown) newSpawns.push(spawn);
+    }
+
+    const pool = await state.pendingScanPools.get(scanId);
+    if (pool) await state.pendingScanPools.put({ ...pool, status: "pending", spawns: newSpawns });
+    logger.info("worker", `scan ${scanId} status: collecting -> pending (${newSpawns.length} spawn(s))`);
+    return "ok";
   }
 
   // Authorizes a scan request (runAreaScan, runSpeciesScan) and, for a
@@ -580,12 +631,10 @@ async function startWorker(publicConfig, secretConfig) {
   // touched.
   async function authorizeScanRequest(fromPubkey, method) {
     if (fromPubkey === transport.identity.hex) return { ok: true, isSelf: true };
-    // A subscriber's scan results can only ever be safely attributed via
-    // the dedicated scan channel (see config.js's own scanChannelId doc
-    // comment) - without one configured there is nowhere for those results
-    // to safely land, so refuse rather than run a scan whose results could
-    // never be told apart from an organic sighting.
-    if (!publicConfig.scanChannelId) return rejectScanRequest(fromPubkey, method, "scan channel not configured - ask the operator to set one up.");
+    // A subscriber's scan runs entirely through miniscord (see
+    // miniscord-connector.js) - without one configured there is no way to
+    // run it at all.
+    if (!miniscordConnector.isConfigured()) return rejectScanRequest(fromPubkey, method, "miniscord not configured - ask the operator to set it up.");
     const subscriber = await state.scanSubscribers.get(fromPubkey);
     if (!subscriber) return rejectScanRequest(fromPubkey, method, "no scan subscription found for this account.");
     if (new Date(subscriber.activeUntil).getTime() < Date.now()) return rejectScanRequest(fromPubkey, method, "scan subscription has expired.");
@@ -599,45 +648,43 @@ async function startWorker(publicConfig, secretConfig) {
   // Starts a bulk area scan (see commands/commands-app.js's "Area scan"
   // section and worker/core/area-scan.js) and returns as soon as it's
   // *started*, not once it finishes - a scan can run for many minutes
-  // (dozens of /pokesearch commands, each with its own settle pause), far
-  // longer than an RPC round trip over Nostr relays should ever block for.
-  // For the operator's own (self) request, this is unchanged from before:
-  // results publish immediately and normally, no pool involved. For a
-  // subscriber, results instead land in a private pendingScanPools row
-  // (see source-feed-connector.js's #emitSpawn) that only they (or the
+  // (dozens of /pokesearch commands through miniscord, each paced behind
+  // the last), far longer than an RPC round trip over Nostr relays should
+  // ever block for. For the operator's own (self) request, results publish
+  // immediately and normally, no pool involved (see runOrganicMiniscordSearch).
+  // For a subscriber, results instead land in a private pendingScanPools
+  // row (see runSubscriberScanViaMiniscord) that only they (or the
   // operator) can read back via getScanResults, and only they (or the
   // operator) can make public via approveScanResults - the request body of
   // that call carries no spawn data at all, only the id, so there is no way
   // for a caller to inject anything into what gets broadcast.
   rpc.handle("runAreaScan", async (params, { fromPubkey }) => {
-    // Validated *before* authorizeScanRequest, deliberately - that call is
-    // what charges one cusuco against a non-self caller's daily quota, and
-    // a subscriber must never be charged for a request that was going to
-    // be rejected anyway. Only centerLat/centerLon and "is a scan already
-    // running" can be checked this early - radiusKmText/rings depend on
-    // auth.isSelf, so those stay validated after (they can never actually
-    // fail for a subscriber, since their values are always the fixed
-    // server-side constants below, not anything the caller supplied).
+    // centerLat/centerLon are validated before authorizeScanRequest,
+    // deliberately - that call is what charges one cusuco against a
+    // non-self caller's daily quota, and a subscriber must never be
+    // charged for a request that was going to be rejected anyway.
+    // radiusKmText/rings depend on auth.isSelf, so those stay validated
+    // after - they can never actually fail for a subscriber, since their
+    // values are always the fixed server-side constants below, not
+    // anything the caller supplied.
     const centerLat = Number(params?.centerLat);
     const centerLon = Number(params?.centerLon);
     if (!Number.isFinite(centerLat) || centerLat < -90 || centerLat > 90) return rejectScanRequest(fromPubkey, "runAreaScan", "centerLat must be a number between -90 and 90.");
     if (!Number.isFinite(centerLon) || centerLon < -180 || centerLon > 180) return rejectScanRequest(fromPubkey, "runAreaScan", "centerLon must be a number between -180 and 180.");
-    if (ahkConnector.isBulkScanActive()) return rejectScanRequest(fromPubkey, "runAreaScan", "A scan is already running.");
 
     const auth = await authorizeScanRequest(fromPubkey, "runAreaScan");
     if (!auth.ok) return auth;
 
-    const { subscriberScanRadiusKmText, areaScanClearGeofilterCommand, defaultGeofilterCommand } = defaultAhkConfig();
+    const { subscriberScanRadiusKmText } = defaultAhkConfig();
     // Two entirely different scan shapes past this point - see
-    // area-scan.js's own doc comment for why. The operator's own
+    // area-scan.js's own doc comment for why - but both submitted through
+    // miniscord now, with no mutex needed between them: the operator's own
     // commands-page scans (self) keep the full hex-lattice/rings design,
-    // specifying their own radius, run in their own normal browser tab; a
-    // subscriber's scan is always a single point at a fixed radius, run as
-    // one switch-tab/search/switch-back sequence in the dedicated second
-    // tab instead of many self-contained circle commands.
+    // specifying their own radius, sent as many self-contained circle
+    // commands one at a time; a subscriber's scan is always a single point
+    // at a fixed radius.
     let total;
     let scanId = null;
-    let runScan;
     if (auth.isSelf) {
       const radiusKmText = String(params?.radiusKmText ?? "").trim();
       const radiusKm = Number(radiusKmText);
@@ -646,45 +693,36 @@ async function startWorker(publicConfig, secretConfig) {
       if (!Number.isInteger(rings) || rings < 1 || rings > 5) return rejectScanRequest(fromPubkey, "runAreaScan", "rings must be an integer between 1 and 5.");
       const points = generateHexLattice({ centerLat, centerLon, radiusKm, rings });
       total = points.length;
-      runScan = () =>
-        ahkConnector
-          .runBulkScan(points, (point) => [buildAreaScanCommand({ ...point, radiusKmText })], undefined, {
-            beforeCommand: areaScanClearGeofilterCommand,
-            afterCommand: defaultGeofilterCommand,
-          })
-          .then((result) => {
-            logger.info(
-              "ahk",
-              result.cancelled ? `area scan cancelled after ${result.sent}/${result.total}` : `area scan done - sent ${result.sent} commands`
-            );
-          });
+      // Deliberately not awaited - see this handler's own doc comment
+      // above: the ack below returns as soon as the scan has *started*.
+      // No retry per circle (matches this scan's own prior AHK-based
+      // behavior, which never verified a reply came back either) - just a
+      // warning and move on if one call fails.
+      (async () => {
+        let sent = 0;
+        for (const point of points) {
+          const result = await runOrganicMiniscordSearch(buildAreaScanCommand({ ...point, radiusKmText }));
+          if (!result.ok) {
+            logger.warn("miniscord", `area scan circle at ${point.lat.toFixed(6)},${point.lon.toFixed(6)} failed: ${result.error}`);
+            continue;
+          }
+          sent++;
+        }
+        logger.info("worker", `area scan done - sent ${sent}/${points.length} commands`);
+      })().catch((err) => logger.error("worker", `area scan failed: ${err.message}`));
     } else {
       total = 1;
       scanId = crypto.randomUUID();
-      activeScanId = scanId;
-      // Not awaited - awaiting this here would delay the enableThenRun()
-      // call below by at least a tick, which is exactly the race that
-      // function's own doc comment (and AhkConnector#runBulkScan's
-      // identical "no await gap" reasoning) exists to prevent: the
-      // scheduled loop's own already-suspended continuation only re-checks
-      // #bulkScanGate at the top of its next iteration, so any gap here is
-      // a window for it to queue a send first, stealing this scan's
-      // priority. A local IndexedDB write completes in well under a
-      // millisecond in practice, long before this scan's own first send
-      // could possibly produce a reply for #emitSpawn to append to this pool.
-      state.pendingScanPools
-        .put({ scanId, scanType: "area", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
-        .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
-      runScan = () =>
-        runSubscriberScan(scanId, fromPubkey, () => buildSubscriberAreaScanCommand({ lat: centerLat, lon: centerLon, radiusKmText: subscriberScanRadiusKmText })).then(
-          (outcome) => {
-            logger.info("ahk", outcome === "ok" ? "area scan done" : "area scan got no usable reply after retries - cusuco reimbursed");
-          }
-        );
+      await state.pendingScanPools.put({ scanId, scanType: "area", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] });
+      // Deliberately not awaited - see this handler's own doc comment
+      // above: the ack below returns as soon as the scan has *started*,
+      // not once it finishes.
+      runSubscriberScanViaMiniscord(scanId, fromPubkey, () => buildSubscriberAreaScanCommand({ lat: centerLat, lon: centerLon, radiusKmText: subscriberScanRadiusKmText }))
+        .then((outcome) => {
+          logger.info("worker", outcome === "ok" ? "area scan done" : "area scan got no usable reply after retries - cusuco reimbursed");
+        })
+        .catch((err) => logger.error("worker", `area scan failed: ${err.message}`));
     }
-
-    // Deliberately not awaited - see this handler's own doc comment above.
-    ahkControls.enableThenRun(runScan).catch((err) => logger.error("ahk", `area scan failed: ${err.message}`));
 
     // The ack itself - returned as soon as the cusuco is charged and the
     // scan is confirmed to actually be starting (see the reordering above:
@@ -706,52 +744,44 @@ async function startWorker(publicConfig, secretConfig) {
   // search hits its own per-query result cap (see the
   // "project_scan_feature_v1_hexlattice" memory for the earlier,
   // conditional-follow-up design this replaced). The command text itself
-  // never changes - only whether it runs in the operator's own normal tab
-  // (self) or the dedicated second tab (subscriber), same split as
-  // runAreaScan.
+  // is now identical for self and subscriber alike (see species-scan.js's
+  // own doc comment) - only the outcome differs: self publishes
+  // organically, a subscriber's goes into a private pool with retries.
   rpc.handle("runSpeciesScan", async (params, { fromPubkey }) => {
     const dexNumber = Number(params?.dexNumber);
     if (!isValidDexNumber(dexNumber)) return rejectScanRequest(fromPubkey, "runSpeciesScan", "dexNumber must be a positive integer below 4096.");
-    if (ahkConnector.isBulkScanActive()) return rejectScanRequest(fromPubkey, "runSpeciesScan", "A scan is already running.");
 
     const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
     if (!auth.ok) return auth;
 
-    const { subscriberSpeciesScanCenterLat, subscriberSpeciesScanCenterLon, subscriberSpeciesScanRadiusKmText } = defaultAhkConfig();
+    const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultAhkConfig();
+    const command = buildSpeciesScanCommand(dexNumber, {
+      lat: defaultSearchCenterLat,
+      lon: defaultSearchCenterLon,
+      radiusKmText: defaultSearchRadiusKmText,
+    });
 
     let scanId = null;
-    let runScan;
     if (auth.isSelf) {
-      const command = buildSpeciesScanCommand(dexNumber);
-      runScan = () =>
-        ahkConnector.runBulkScan([dexNumber], () => [command]).then((result) => {
-          logger.info("ahk", result.cancelled ? "species scan cancelled" : `species scan done for dex #${dexNumber}`);
-        });
+      // Deliberately not awaited - see runAreaScan's own doc comment.
+      runOrganicMiniscordSearch(command)
+        .then((result) => {
+          logger.info("worker", result.ok ? `species scan done for dex #${dexNumber}` : `species scan for dex #${dexNumber} failed: ${result.error}`);
+        })
+        .catch((err) => logger.error("worker", `species scan failed: ${err.message}`));
     } else {
       scanId = crypto.randomUUID();
-      activeScanId = scanId;
-      // Not awaited - see runAreaScan's identical "no await gap before
-      // enableThenRun" reasoning.
-      state.pendingScanPools
-        .put({ scanId, scanType: "species", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] })
-        .catch((err) => logger.error("worker", `failed to create pending scan pool: ${err.message}`));
-      runScan = () =>
-        runSubscriberScan(scanId, fromPubkey, () =>
-          buildSubscriberSpeciesScanCommand(dexNumber, {
-            lat: subscriberSpeciesScanCenterLat,
-            lon: subscriberSpeciesScanCenterLon,
-            radiusKmText: subscriberSpeciesScanRadiusKmText,
-          })
-        ).then((outcome) => {
+      await state.pendingScanPools.put({ scanId, scanType: "species", requestedByPubkeyHex: fromPubkey, createdAt: Date.now(), status: "collecting", spawns: [] });
+      // Deliberately not awaited - see runAreaScan's own doc comment.
+      runSubscriberScanViaMiniscord(scanId, fromPubkey, () => command)
+        .then((outcome) => {
           logger.info(
-            "ahk",
+            "worker",
             outcome === "ok" ? `species scan done for dex #${dexNumber}` : `species scan for dex #${dexNumber} got no usable reply after retries - cusuco reimbursed`
           );
-        });
+        })
+        .catch((err) => logger.error("worker", `species scan failed: ${err.message}`));
     }
-
-    // Deliberately not awaited - see runAreaScan's own doc comment.
-    ahkControls.enableThenRun(runScan).catch((err) => logger.error("ahk", `species scan failed: ${err.message}`));
 
     logger.info(
       "worker",
@@ -1040,7 +1070,7 @@ function populateSetupForm(publicConfig, secretConfig) {
   document.getElementById("field-relays").value = publicConfig.relays.join("\n");
   document.getElementById("field-source-feed-channels").value = publicConfig.trackedChannelIds.join("\n");
   document.getElementById("field-watch-channel-name").value = publicConfig.watchChannelName;
-  document.getElementById("field-scan-channel-id").value = publicConfig.scanChannelId;
+  document.getElementById("field-miniscord-url").value = publicConfig.miniscordUrl;
   document.getElementById("field-google-client-id").value = publicConfig.googleClientId;
   document.getElementById("field-vapid-public").value = publicConfig.vapidPublicKey;
   document.getElementById("field-vapid-contact").value = publicConfig.vapidContact;
@@ -1055,7 +1085,7 @@ function readSetupForm() {
     relays: parseLines(document.getElementById("field-relays").value),
     trackedChannelIds: parseLines(document.getElementById("field-source-feed-channels").value),
     watchChannelName: document.getElementById("field-watch-channel-name").value.trim(),
-    scanChannelId: document.getElementById("field-scan-channel-id").value.trim(),
+    miniscordUrl: document.getElementById("field-miniscord-url").value.trim(),
     googleClientId: document.getElementById("field-google-client-id").value.trim(),
     vapidPublicKey: document.getElementById("field-vapid-public").value.trim(),
     vapidContact: document.getElementById("field-vapid-contact").value.trim(),

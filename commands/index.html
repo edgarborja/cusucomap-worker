@@ -69,9 +69,8 @@
       <h2>Area scan <span class="hint">(one-time - runs now, doesn't touch the loop above)</span></h2>
       <p class="lede">
         Covers a wide area by splitting it into many small, overlapping <code>/pokesearch</code> queries in a
-        hex-packed pattern, since a single query caps out at a limited number of results. Sends immediately with
-        priority over the worker's normal schedule; progress only shows up in the worker's own activity log, not
-        here.
+        hex-packed pattern, since a single query caps out at a limited number of results. Sent through miniscord,
+        one at a time, a few seconds apart; progress only shows up in the worker's own activity log, not here.
       </p>
       <form id="area-scan-form">
         <label>Center point (lat,lon)

@@ -101,6 +101,32 @@ export async function resolveSpecies(speciesRaw, cache = defaultCache) {
   return fallback;
 }
 
+/**
+ * Resolves a National Pokédex number to its species' display name (e.g.
+ * 398 -> "Staraptor"). For the rare case a source only gives a dex number,
+ * never a name - see worker/core/miniscord-gym.js for why a mega raid's
+ * true boss is only ever conveyed this way. Every other resolveSpecies
+ * caller already has real display text and only needs sprite/types, so
+ * this is intentionally the only direction that goes number -> name.
+ * @returns {Promise<string|null>}
+ */
+export async function resolveSpeciesNameByDexNumber(dexNumber, cache = defaultCache) {
+  const cacheKey = `dexName:${dexNumber}`;
+  const cached = await cache.get(cacheKey);
+  if (cached !== null && cached !== undefined) return cached;
+  try {
+    const res = await fetch(`https://pokeapi.co/api/v2/pokemon-species/${dexNumber}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const name = data.name.charAt(0).toUpperCase() + data.name.slice(1);
+    await cache.set(cacheKey, name);
+    return name;
+  } catch (err) {
+    console.warn(`[species-resolver] could not resolve dex number ${dexNumber}:`, err.message);
+    return null;
+  }
+}
+
 // PokeAPI's item slug for a Poke Ball is hyphenated; the in-game name isn't.
 const ITEM_SLUG_OVERRIDES = { pokeball: "poke-ball" };
 const CUSTOM_ITEM_SPRITES = {

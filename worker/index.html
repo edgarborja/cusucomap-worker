@@ -42,12 +42,12 @@
           <textarea id="field-source-feed-channels" rows="3" placeholder="123456789012345678"></textarea>
         </label>
 
-        <label>Watch channel name <span class="hint">(sidebar dnd-name of the channel whose unread badge should trigger an immediate priority scan + clear - leave blank to disable)</span>
+        <label>Watch channel <span class="hint">(channel id or name checked via miniscord's GET /unread - a genuinely new message there triggers a fixed iv100 pokesearch; leave blank to disable)</span>
           <input id="field-watch-channel-name" type="text" />
         </label>
 
-        <label>Scan channel id <span class="hint">(the channel id the dedicated second browser tab sits on, used only for a subscriber's own "cusuco" scan replies - never scheduled searches or organic sightings. Leave blank to disable subscriber scans.)</span>
-          <input id="field-scan-channel-id" type="text" placeholder="123456789012345678" />
+        <label>Miniscord URL <span class="hint">(base URL of a running miniscord instance, e.g. http://127.0.0.1:8770 - used for a subscriber's own "cusuco" area/species scan. Leave blank to disable subscriber scans.)</span>
+          <input id="field-miniscord-url" type="text" placeholder="http://127.0.0.1:8770" />
         </label>
 
         <label>Google OAuth client id <span class="hint">(not secret - this is the audience, not a credential)</span>
@@ -96,7 +96,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-18 22:05 UTC</p>
+    <p id="build-date">Build: 2026-09-19 21:22 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -150,8 +150,8 @@
       <h2>Bulk scans</h2>
       <p class="hint">
         Runs a full pass of geofilter + search commands over a pasted list of scan-group centers (columns:
-        Latitude, Longitude, Distance in meters, GroupMemberCount - order doesn't matter). Takes priority over the
-        scheduled loop and hundo detection until it finishes or is cancelled.
+        Latitude, Longitude, Distance in meters, GroupMemberCount - order doesn't matter). Takes priority over
+        daily commands until it finishes or is cancelled.
       </p>
 
       <details id="quest-scan-details">

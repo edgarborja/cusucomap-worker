@@ -232,7 +232,7 @@ document.getElementById("area-scan-form").addEventListener("submit", async (even
   }
 
   const total = areaScanCircleCount(rings);
-  if (!confirm(`Start an area scan of ${total} commands? This takes priority over the worker's normal schedule until it finishes.`)) return;
+  if (!confirm(`Start an area scan of ${total} commands through miniscord? This can take a while - each command is paced a few seconds apart.`)) return;
 
   statusEl.textContent = "Starting…";
   statusEl.hidden = false;

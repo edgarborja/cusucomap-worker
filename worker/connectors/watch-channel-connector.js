@@ -1,98 +1,88 @@
-// Reacts to the watched channel's unread badge (detected bridge-side by the
-// companion script's Source Feed-tab half - see its isWatchChannelUnread/
-// pollWatchChannelUnread) by pressing the clear-unread hotkey and running a
-// short priority search scan through AhkConnector, in that order - see
-// AhkConnector#sendSequence/#sendHotkey and worker-bridge/http_send.ahk's
-// HOTKEY_PREFIX handling for the AHK-side half of that.
+// Watches a channel for a genuinely new message via miniscord's own
+// GET /unread/{idOrName}, and runs a fixed "special" pokesearch (see
+// worker-app.js's own runSpecialSearch callback) the moment one shows up -
+// this repo's automated response to a 100% IV Pokémon posted elsewhere in
+// the server.
 //
-// Detection lives entirely in the Source Feed tab, which has no visibility
-// into AhkConnector's own scheduling state - but no coordination is needed
-// here either: sendSequence/sendHotkey both go through AhkConnector's own
-// #sendChain, so this naturally queues behind whatever scheduled search or
-// daily command (if any) is already mid-send. It does still have to issue
-// both calls back-to-back with no `await` in between, though - see
-// #handleAlert's own comment for why.
-import { BRIDGE_EVENTS, bridgeChannel } from "../transports/bridge-channel.js";
+// Supersedes the earlier Source Feed-tab bridge (WATCH_CHANNEL_ALERT/
+// SET_WATCH_CHANNEL_NAME - see git history) + AHK clear-unread-hotkey
+// design: GET /unread's own `unread` flag is confirmed (per miniscord's
+// own docs) to never reset itself once true, so it can't be used to detect
+// a *new* message on its own - only a change in `lastMessageId` can. That
+// also removes the entire reason the old design had to press a hotkey at
+// all: that existed purely to re-arm the bridge script's own DOM-badge
+// debounce so a second hundo landing soon after the first still got its
+// own alert - lastMessageId tracking has no such debounce to re-arm.
+const POLL_INTERVAL_MS = 15_000;
 
 export class WatchChannelConnector {
-  #bus;
   #logger;
   #getWatchChannelName;
-  #getPriorityScanConfig;
-  #getClearUnreadHotkey;
-  #ahkConnector;
-  #isAhkEnabled;
-  #lastSeenSeq = 0;
-  #busy = false;
+  #miniscordConnector;
+  #runSpecialSearch;
+  #lastSeenMessageIdCache;
+  #lastSeenMessageId = null;
+  #lastCheckedAt = 0;
+  #checking = false;
 
   /**
-   * @param {() => string} getWatchChannelName - sidebar dnd-name to watch, pushed to the bridge on start().
-   * @param {() => {messages: string[], pause: {minS: number, maxS: number}}} getPriorityScanConfig
-   * @param {() => string} getClearUnreadHotkey - AHK Send-command key notation, e.g. "+{Escape}".
-   * @param {() => boolean} isAhkEnabled - the dashboard's "Enable AHK" toggle (see worker-app.js's wireAhkControls) - same guard the manual "send now" form already respects; this connector must not send anything while it's off.
+   * @param {() => string} getWatchChannelName - channel id/name to pass as GET /unread/{idOrName}'s path segment - leave blank to disable.
+   * @param {import("./miniscord-connector.js").MiniscordConnector} miniscordConnector
+   * @param {() => Promise<{ok:boolean, error?:string}>} runSpecialSearch - runs the fixed iv100 pokesearch and publishes whatever it finds.
+   * @param {{get: () => Promise<string|null>, set: (id: string) => Promise<void>}} lastSeenMessageIdCache - persisted (not just in-memory) so a restart doesn't mistake a message that was already unread before the restart for a brand new one.
    */
-  constructor({ bus, logger, getWatchChannelName, getPriorityScanConfig, getClearUnreadHotkey, ahkConnector, isAhkEnabled }) {
-    this.#bus = bus;
+  constructor({ logger, getWatchChannelName, miniscordConnector, runSpecialSearch, lastSeenMessageIdCache }) {
     this.#logger = logger;
     this.#getWatchChannelName = getWatchChannelName;
-    this.#getPriorityScanConfig = getPriorityScanConfig;
-    this.#getClearUnreadHotkey = getClearUnreadHotkey;
-    this.#ahkConnector = ahkConnector;
-    this.#isAhkEnabled = isAhkEnabled;
+    this.#miniscordConnector = miniscordConnector;
+    this.#runSpecialSearch = runSpecialSearch;
+    this.#lastSeenMessageIdCache = lastSeenMessageIdCache;
   }
 
-  start() {
-    bridgeChannel.send(BRIDGE_EVENTS.SET_WATCH_CHANNEL_NAME, { name: this.#getWatchChannelName() });
-    bridgeChannel.on(BRIDGE_EVENTS.WATCH_CHANNEL_ALERT, (alert) => this.#handleAlert(alert).catch((err) => this.#logger.error("watch-channel", err.message)));
+  async start() {
+    this.#lastSeenMessageId = await this.#lastSeenMessageIdCache.get();
+    setInterval(() => this.#checkIfDue(), POLL_INTERVAL_MS);
+    this.#checkIfDue();
   }
 
-  async #handleAlert(alert) {
-    if (alert.seq <= this.#lastSeenSeq) return; // stale/duplicate GM value replay
-    this.#lastSeenSeq = alert.seq;
+  /**
+   * Safe to call after any other miniscord round trip completes (search,
+   * gym poll) - a no-op unless POLL_INTERVAL_MS has actually elapsed since
+   * the last real check, so an opportunistic caller never causes more than
+   * one genuine GET /unread call per interval. This is what lets a new
+   * message get noticed sooner than the next scheduled poll tick without
+   * the connector needing to know anything about what triggered it.
+   */
+  notifyMiniscordActivity() {
+    this.#checkIfDue();
+  }
 
-    if (!this.#isAhkEnabled()) {
-      this.#logger.warn("watch-channel", "unread badge detected but AHK is disabled - not scanning/clearing.");
-      return;
-    }
-    if (this.#busy) {
-      this.#logger.warn("watch-channel", "alert arrived while already handling a previous one - dropping (the badge will reappear if this one wasn't actually cleared).");
-      return;
-    }
+  #checkIfDue() {
+    if (Date.now() - this.#lastCheckedAt < POLL_INTERVAL_MS) return;
+    this.#check().catch((err) => this.#logger.error("watch-channel", err.message));
+  }
 
-    this.#busy = true;
+  async #check() {
+    const channelName = this.#getWatchChannelName();
+    if (!channelName || !this.#miniscordConnector.isConfigured() || this.#checking) return;
+
+    this.#checking = true;
+    this.#lastCheckedAt = Date.now();
     try {
-      // A bulk scan (see worker/core/scan-groups.js, AhkConnector#runBulkScan)
-      // takes priority over this - wait it out rather than interleave with
-      // it. Deliberately before the no-await-gap pair below, not between
-      // its two calls.
-      await this.#ahkConnector.waitForBulkScanClear();
+      const result = await this.#miniscordConnector.getUnread(channelName);
+      if (!result.ok) {
+        this.#logger.warn("watch-channel", `unread check failed: ${result.error}`);
+        return;
+      }
+      if (!result.lastMessageId || result.lastMessageId === this.#lastSeenMessageId) return;
 
-      const { messages, pause } = this.#getPriorityScanConfig();
-      this.#logger.info("watch-channel", `unread badge detected - clearing it, then sending priority scan (${messages.length} searches)`);
-
-      // Clear first, scan second: clearing the badge sooner (rather than
-      // after the scan) is what re-arms the companion script's own debounce
-      // (see isWatchChannelUnread/pollWatchChannelUnread) as fast as
-      // possible, so a second hundo landing shortly after this one still
-      // gets its own alert instead of being masked by a badge that's still
-      // sitting unread from the first.
-      //
-      // Both sends below MUST be issued here with no `await` between them.
-      // AhkConnector#sendSerialized appends to its shared chain the instant
-      // it's called (synchronously) - awaiting the first call before making
-      // the second used to leave exactly one open slot in that chain, and
-      // an unrelated scheduled search (running on its own independent
-      // timer) reliably won the race to fill it, landing between the scan
-      // and the clear every time this was observed live. Firing both calls
-      // back-to-back with no intervening `await` closes that gap: nothing
-      // else can get a turn in the single JS tick between them.
-      const hotkeySend = this.#ahkConnector.sendHotkey(this.#getClearUnreadHotkey());
-      const scanSend = this.#ahkConnector.sendSequence(messages, pause);
-      await Promise.all([hotkeySend, scanSend]);
-
-      this.#bus.emit("watch-channel.cycle-complete", { at: Date.now() });
+      this.#lastSeenMessageId = result.lastMessageId;
+      await this.#lastSeenMessageIdCache.set(result.lastMessageId);
+      this.#logger.info("watch-channel", "new message on the watched channel - running the special pokesearch");
+      const searchResult = await this.#runSpecialSearch();
+      if (!searchResult.ok) this.#logger.warn("watch-channel", `special pokesearch failed: ${searchResult.error}`);
     } finally {
-      this.#busy = false;
+      this.#checking = false;
     }
   }
 }

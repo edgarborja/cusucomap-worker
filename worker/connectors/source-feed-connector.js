@@ -26,8 +26,6 @@ export class SourceFeedConnector {
   #state;
   #getGeofilterAnchor;
   #getTrackedChannelIds;
-  #getScanChannelId;
-  #getActiveScanId;
   #seenMessageIds = new Set();
   #speciesCache;
 
@@ -36,17 +34,13 @@ export class SourceFeedConnector {
    *   configured disambiguation center, used only when a quest/raid name
    *   matches more than one bundled POI and no exact coordinates came with it.
    * @param {() => string[]} getTrackedChannelIds - Source Feed channel ids the bridge should scrape; pushed to it on start() and whenever a Source Feed tab (re)connects, since the bridge script itself has no hardcoded channel to fall back on.
-   * @param {() => string} getScanChannelId - the channel id the dedicated second browser tab sits on (see config.js's own doc comment on scanChannelId). A message is only ever eligible for a subscriber's private pool if it arrived on *this* channel - a structural check independent of getActiveScanId's timing, so an organic reply on any other channel can never be captured into a pool no matter what activeScanId happens to be at that instant, and a stray reply on this channel with no scan active is dropped rather than ever becoming public.
-   * @param {() => string|null} getActiveScanId - lazy accessor set (by worker-app.js's runAreaScan handler) for the duration of a subscriber-requested scan's own bulk-scan-priority window; null the rest of the time. While set *and* the message is on the scan channel, a parsed spawn is appended to that scan's private pending pool instead of becoming normal authoritative state - see #emitSpawn.
    */
-  constructor({ bus, logger, state, getGeofilterAnchor, getTrackedChannelIds, getScanChannelId, getActiveScanId }) {
+  constructor({ bus, logger, state, getGeofilterAnchor, getTrackedChannelIds }) {
     this.#bus = bus;
     this.#logger = logger;
     this.#state = state;
     this.#getGeofilterAnchor = getGeofilterAnchor;
     this.#getTrackedChannelIds = getTrackedChannelIds;
-    this.#getScanChannelId = getScanChannelId;
-    this.#getActiveScanId = getActiveScanId;
     this.#speciesCache = {
       get: (key) => this.#state.workerMetadata.get(`speciesResolverCache:${key}`, null),
       set: (key, value) => this.#state.workerMetadata.set(`speciesResolverCache:${key}`, value),
@@ -55,12 +49,6 @@ export class SourceFeedConnector {
 
   #pushTrackedChannels() {
     bridgeChannel.send(BRIDGE_EVENTS.SET_TRACKED_CHANNEL_IDS, { channelIds: this.#getTrackedChannelIds() });
-  }
-
-  /** See getScanChannelId's own doc comment - false if unconfigured, never matches an empty channelId. */
-  #isScanChannel(channelId) {
-    const scanChannelId = this.#getScanChannelId();
-    return Boolean(scanChannelId) && channelId === scanChannelId;
   }
 
   start() {
@@ -127,14 +115,6 @@ export class SourceFeedConnector {
       // stands out from routine activity in the log.
       this.#markSeen(messageId);
       this.#logger.warn("source-feed", `bot error: "${applicationError}"`);
-      // Lets a subscriber scan's own orchestration (see worker-app.js's
-      // runAreaScan/runSpeciesScan) know its search failed, so it can retry
-      // - see this file's own getActiveScanId/getScanChannelId doc
-      // comments. Gated on the scan channel, not just activeScanId's own
-      // timing: an error on any other channel is never this scan's own
-      // reply, no matter what activeScanId says at that instant.
-      const activeScanId = this.#getActiveScanId();
-      if (activeScanId && this.#isScanChannel(channelId)) this.#bus.emit("scanReply.observed", { scanId: activeScanId, kind: "error", error: applicationError });
       return;
     }
 
@@ -147,8 +127,6 @@ export class SourceFeedConnector {
       // scanning the activity log (e.g. after an area scan) can tell a
       // search genuinely came back empty rather than silently failing.
       this.#logger.info("source-feed", `no results: "${contentEl.textContent.trim()}"`);
-      const activeScanId = this.#getActiveScanId();
-      if (activeScanId && this.#isScanChannel(channelId)) this.#bus.emit("scanReply.observed", { scanId: activeScanId, kind: "empty" });
       return;
     }
 
@@ -272,16 +250,6 @@ export class SourceFeedConnector {
   }
 
   async #emitSpawn(ids, spawn, index) {
-    const activeScanId = this.#getActiveScanId();
-    const isScanReply = Boolean(activeScanId) && this.#isScanChannel(ids.channelId);
-    // Signals a subscriber scan's own orchestration that *some* reply to
-    // its search arrived - even one unusable below (no despawn timer, no
-    // exact coords) still proves the command got a real response, which is
-    // what decides whether a bot-error reply gets retried (see
-    // worker-app.js's runAreaScan/runSpeciesScan and this file's own
-    // getActiveScanId/getScanChannelId doc comments).
-    if (isScanReply) this.#bus.emit("scanReply.observed", { scanId: activeScanId, kind: "spawn" });
-
     if (spawn.despawnInMinutes === null) {
       this.#logger.warn("source-feed", `no parseable despawn timer for ${spawn.species} - skipping (can't derive despawnAt)`);
       return;
@@ -328,34 +296,6 @@ export class SourceFeedConnector {
       unevolved: false,
     };
 
-    // While a subscriber-requested scan holds bulk-scan priority *and* this
-    // message arrived on the dedicated scan channel (see getScanChannelId's
-    // own doc comment - a structural check, not just activeScanId's
-    // timing), everything it turns up goes into that scan's own private
-    // pending pool instead of becoming normal authoritative state - it
-    // never reaches PokemonStateService, so it doesn't appear on this
-    // worker's own map/dashboard or trigger notifications, until the
-    // requester explicitly approves it (see approveScanResults). The
-    // operator's own (self) scans are unaffected - activeScanId is only
-    // ever set for a non-self requester, and self scans never run in the
-    // scan channel anyway.
-    if (isScanReply) {
-      // stableIntId(stableSpawnKey(...)) (already computed above, as `id`)
-      // is deterministic per real-world spawn - the same species/coords/cp
-      // always produces the same id regardless of which search turned it
-      // up. That's what lets "already public knowledge" mean something
-      // concrete here: if this exact spawn is already active state.spawns
-      // (published from some earlier search, in or out of a scan), it
-      // isn't a new discovery for this subscriber to take credit for -
-      // skip adding it to their pool rather than showing them something
-      // that's already on the public map. An expired/despawned prior
-      // sighting under the same id doesn't count as "known" - it's no
-      // longer visible to anyone, so this sighting is worth surfacing.
-      const existing = await this.#state.spawns.get(normalized.id);
-      const alreadyKnown = Boolean(existing) && existing.status === "active" && new Date(existing.despawnAt).getTime() > Date.now();
-      if (!alreadyKnown) await this.#state.pendingScanPools.appendSpawn(activeScanId, normalized);
-      return;
-    }
     this.#bus.emit("spawn.observed", normalized);
   }
 }

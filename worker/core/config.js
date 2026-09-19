@@ -25,8 +25,8 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
  * @property {string} vapidContact - "mailto:you@example.com", required by the Web Push VAPID spec.
  * @property {boolean} rememberSecrets
  * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
- * @property {string} watchChannelName - sidebar dnd-name of the channel whose unread badge signals a hundo may have posted elsewhere (see worker/connectors/watch-channel-connector.js); pushed to the bridge the same way trackedChannelIds is.
- * @property {string} scanChannelId - the Source Feed channel id the dedicated second browser tab (see area-scan.js's wrapForSubscriberScanTab) sits on, used *only* for a subscriber's own "cusuco" scan replies - never for scheduled searches, daily commands, or organic sightings. Pushed to the bridge alongside trackedChannelIds (so it actually gets scraped) but tracked separately here: source-feed-connector.js's #handleMessage only ever considers a message for a subscriber's private pool if it arrived on *this* channel, regardless of any activeScanId timing - a structural safety net, not just a timing one, against a normal search's own results ever leaking into a private pool (or vice versa). Empty means "not configured" - subscriber scans simply won't have anywhere safe to land until this is set.
+ * @property {string} watchChannelName - channel id or name whose unread state (via miniscord's own GET /unread/{idOrName}) signals a hundo may have posted elsewhere (see worker/connectors/watch-channel-connector.js) - leave blank to disable.
+ * @property {string} miniscordUrl - base URL of a running miniscord instance (e.g. "http://127.0.0.1:8770"), used for a subscriber's own "cusuco" area/species scan (see worker/connectors/miniscord-connector.js) - a direct REST call to miniscord's own POST /pokesearch, not a browser/AHK/Tampermonkey round trip. Empty means "not configured" - subscriber scans are rejected until this is set.
  */
 
 /** @returns {PublicConfig} */
@@ -39,7 +39,7 @@ export function defaultPublicConfig() {
     vapidContact: "mailto:example@example.com",
     rememberSecrets: false,
     watchChannelName: "",
-    scanChannelId: "",
+    miniscordUrl: "",
     // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
     // tracked channel's own /geofilter setting at the time this default was
     // captured.
@@ -48,7 +48,10 @@ export function defaultPublicConfig() {
 }
 
 /**
- * AutoHotKey connector scheduling config. Deliberately NOT part of
+ * Search scheduling config, shared between AhkConnector (daily commands,
+ * quest-scan/raid-scan - still real keystrokes) and worker-app.js's own
+ * miniscord-driven scheduled loop (scheduledSearches below - a REST call,
+ * no browser/AHK involved). Deliberately NOT part of
  * PublicConfig/persisted to localStorage - there's no setup-screen field
  * that ever lets the operator edit this, so routing it through saved
  * config only meant a stale copy could silently outlive a code update
@@ -59,6 +62,13 @@ export function defaultPublicConfig() {
  */
 export function defaultAhkConfig() {
   return {
+    // Each entry is a filter (no location of its own) - run through
+    // miniscord with defaultSearchCenterLat/Lon/RadiusKmText below appended,
+    // one at a time, resting batchRestMinMin/MaxMin between full passes.
+    // Storage/editing still goes through AhkConnector's own
+    // getCommands/applyCommands (see commands/commands-app.js) even though
+    // AHK itself no longer sends these - it's just the established,
+    // admin-edited source of truth for this list.
     scheduledSearches: [
       "/pokesearch iv100",
       "/pokesearch iv95",
@@ -72,8 +82,12 @@ export function defaultAhkConfig() {
       "/pokesearch lvl35",
       "/pokesearch lvl31 iv65",
     ],
+    // Still used for daily commands and quest-scan/raid-scan's own AHK
+    // pacing - unrelated to the miniscord-routed scheduledSearches above,
+    // which uses MiniscordConnector's own built-in pacing instead.
     searchPauseMinS: 8,
     searchPauseMaxS: 15,
+    // Rest between full passes of scheduledSearches, regardless of transport.
     batchRestMinMin: 2,
     batchRestMaxMin: 3,
     // Fallback only - both scheduledSearches above and dailyCommands below
@@ -91,59 +105,32 @@ export function defaultAhkConfig() {
       { message: "/questset addchannel", hour: 23, minute: 0 },
       { message: "/raidset addchannel", hour: 4, minute: 0 },
     ],
-    // Sent immediately (not on the usual schedule) when the watch channel's
-    // unread badge fires, before the scheduledSearches rotation above
-    // resumes on its own - just the one hundo search, not the full 11-item
-    // rotation, so the clear-unread hotkey below doesn't sit behind several
-    // unrelated searches before it can fire.
-    priorityScanMessages: ["/pokesearch iv100"],
-    priorityScanPauseMinS: 3,
-    priorityScanPauseMaxS: 6,
-    // AHK key notation (see worker-bridge/http_send.ahk's Send call) for whatever combo
-    // marks every channel read - sent as one queued item via the "#HOTKEY# "
-    // sentinel, after the priority scan above finishes.
-    clearUnreadHotkey: "+{Escape}",
-    // Sent (with a doubled Enter - see ahk-connector.js's #sendDoubleEnter)
-    // immediately before an area scan's own per-circle searches start - each
-    // of those already carries its own explicit query area, so a leftover
-    // geofilter from before the scan would otherwise interact with them
-    // unpredictably.
-    areaScanClearGeofilterCommand: "/pokeset geofilter clear:confirm",
-    // Restores the normal working geofilter: sent (single Enter) right
-    // after an area scan finishes or is cancelled, before the normal
-    // schedule resumes - and also once at worker startup on the very first
-    // AHK enable, in case a previous run got interrupted mid-scan and left
-    // the geofilter cleared. See worker-app.js's runAreaScan RPC handler
-    // and wireAhkControls' own startup hook. The tab between the two named
-    // params (not a plain space) is required - see scan-groups.js's
-    // PARAM_SEPARATOR for why: a plain space becomes part of the first
-    // param's own typed value rather than moving to the next field, but
-    // http_send.ahk's TypeIt already sends a real {Tab} keypress for `\t`.
-    defaultGeofilterCommand: "/pokeset geofilter radius:10km\tcenter:13.677440,-89.283353",
     // How many area/species scans a single "cusuco" scan subscriber (see
     // worker-app.js's runAreaScan and the commands page's "Scan subscribers"
     // panel) can run per calendar day - shared across scan types, not one
     // allowance per type. Has no effect on the operator's own (self-pubkey)
     // scans, which are unlimited as today.
     scanDailyLimitPerSubscriber: 1,
-    // The geofilter radius for a subscriber-requested area scan's one
-    // point - fixed server-side, never something the caller supplies (see
+    // The radius for a subscriber-requested area scan's one point - fixed
+    // server-side, never something the caller supplies (see
     // worker-app.js's runAreaScan and area-scan.js's
-    // buildSubscriberAreaScanCommands). A string, not a number: embedded
+    // buildSubscriberAreaScanCommand). A string, not a number: embedded
     // verbatim into the generated command text. Has no effect on the
     // operator's own (self-pubkey) scans, which still use the full
     // hex-lattice/rings design with their own radius as today.
     subscriberScanRadiusKmText: "0.1",
-    // Fixed center/radius embedded in every subscriber species scan command
-    // (see species-scan.js's buildSubscriberSpeciesScanCommand) - same
-    // reasoning as subscriberScanRadiusKmText above: the dedicated scan
-    // channel carries no ambient geofilter of its own, so a species search
-    // there has to carry its own explicit area or it isn't restricted to
-    // anywhere near this map at all. Same center as defaultGeofilterCommand
-    // above (the tracked channel's own default /geofilter setting).
-    subscriberSpeciesScanCenterLat: 13.67744,
-    subscriberSpeciesScanCenterLon: -89.283353,
-    subscriberSpeciesScanRadiusKmText: "10",
+    // Fixed center/radius used wherever a pokesearch command submitted
+    // through miniscord needs an explicit area but has no location of its
+    // own to search around: every species scan (see species-scan.js's
+    // buildSpeciesScanCommand, self and subscriber alike) and every
+    // scheduled/priority-scan filter search (see worker-app.js) -
+    // miniscord's own channel carries no ambient geofilter, unlike the
+    // operator's tab, so without this those searches would cover the whole
+    // world instead of just this map. Matches the tracked channel's own
+    // former default /pokeset geofilter setting.
+    defaultSearchCenterLat: 13.67744,
+    defaultSearchCenterLon: -89.283353,
+    defaultSearchRadiusKmText: "10",
   };
 }
 
