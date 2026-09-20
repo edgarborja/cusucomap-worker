@@ -96,7 +96,12 @@ export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = ne
     cityRaw: null,
     scrapedAt: new Date().toISOString(),
     status: "active",
-    spriteUrl: sprite ? sprite.spriteUrl : gym.raid.bossImageUrl || null,
+    // Never fall back to gym.raid.bossImageUrl (Niantic's own asset) -
+    // matches source-feed-connector.js's own #emitRaid, which has never
+    // used anything but a resolved PokeAPI sprite (or null) for a Raid's
+    // spriteUrl, keeping every raid's art visually consistent regardless
+    // of which path it came in through.
+    spriteUrl: sprite ? sprite.spriteUrl : null,
     types: sprite ? sprite.types : [],
   };
 }
