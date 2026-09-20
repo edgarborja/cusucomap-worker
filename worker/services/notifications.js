@@ -127,18 +127,21 @@ function buildNotificationPayload(matches) {
 }
 
 // Mirrors cusucomap-viewer's src/cusuco-sidebar.ts's NOTE_BADGE_DEFS_ES
-// exactly - these are the same five badges the viewer's own spawn detail
-// pane already computes from a spawn's own fields, just evaluated
-// worker-side against `preferences.badges` instead of always-on. Keyed by
-// the same recognized-value strings a device sends in that array; an
-// unrecognized string in `preferences.badges` (typo, future viewer-side
-// addition not yet mirrored here) is simply never matched, not an error -
-// matching this file's existing tolerance for species/types.
+// exactly - these are the same badges the viewer's own spawn detail pane
+// already computes from a spawn's own fields, just evaluated worker-side
+// against `preferences.badges` instead of always-on. Keyed by the same
+// recognized-value strings a device sends in that array; an unrecognized
+// string in `preferences.badges` (typo, future viewer-side addition not
+// yet mirrored here) is simply never matched, not an error - matching
+// this file's existing tolerance for species/types. `xxs` added here
+// ahead of the viewer actually exposing a toggle for it - harmless until
+// then, since no device can send it in `preferences.badges` yet.
 const BADGE_MATCHERS = {
   zeroIv: (spawn) => spawn.ivPercent === 0,
   maxLevel: (spawn) => spawn.level === 35,
   highCp: (spawn) => spawn.cp !== null && spawn.cp >= 2500,
   xxl: (spawn) => spawn.sizeTag === "XXL",
+  xxs: (spawn) => spawn.sizeTag === "XXS",
   dulceXl: (spawn) => spawn.level !== null && spawn.level >= 31 && spawn.level <= 34,
   pvp: (spawn) => spawn.ivSpread?.atk === 0 && spawn.ivSpread?.def === 15 && spawn.ivSpread?.sta === 15,
 };

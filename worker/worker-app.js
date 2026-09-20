@@ -31,6 +31,31 @@ import { KIND_SPAWN, KIND_QUEST, KIND_RAID, TRUSTED_VIEWER_PUBKEYS_HEX } from ".
 
 const WORKER_STATUS_INTERVAL_MS = 60_000;
 
+// This tab is meant to stay open indefinitely as the live backend, so
+// nothing else would ever prompt it to pick up a fresh deploy on its own -
+// polling for a new Build: timestamp (deploy.sh stamps a fresh one into
+// this exact file's own HTML every deploy - see its own comment) and
+// reloading is the only way that happens automatically. sessionStorage
+// (not localStorage - cleared when the tab closes, not a new persisted
+// "remember" setting) carries the exact config this instance was running
+// with across that one self-triggered reload, so main() can jump straight
+// back into a running worker with no re-entry needed on the very next
+// load - even when "remember secrets" was never turned on, since this is
+// carrying forward an already-running session, not establishing a new
+// persisted one. Same trust model as that existing "remember" opt-in
+// already accepts (any JS on this origin can read either storage) - not a
+// new class of exposure, just a shorter-lived instance of the same one.
+const UPDATE_CHECK_INTERVAL_MS = 60_000;
+const AUTO_RESUME_SESSION_KEY = "cusucomap-worker:auto-resume:v1";
+
+function getRenderedBuildDate() {
+  return document.getElementById("build-date")?.textContent ?? null;
+}
+
+function extractBuildDate(html) {
+  return html.match(/id="build-date">([^<]*)<\/p>/)?.[1] ?? null;
+}
+
 function parseLines(text) {
   return text
     .split("\n")
@@ -1063,6 +1088,35 @@ async function startWorker(publicConfig, secretConfig) {
     }, 3000);
   });
 
+  // See UPDATE_CHECK_INTERVAL_MS/AUTO_RESUME_SESSION_KEY's own comment for
+  // why this exists at all. Skipped entirely if the currently-rendered
+  // page has no build-date element to compare against (shouldn't happen
+  // on a real deploy, but a stray dev-server load has nothing meaningful
+  // to detect a change against either way).
+  const runningBuildDate = getRenderedBuildDate();
+  if (runningBuildDate) {
+    setInterval(async () => {
+      let latestBuildDate;
+      try {
+        const res = await fetch(location.pathname, { cache: "no-store" });
+        if (!res.ok) return;
+        latestBuildDate = extractBuildDate(await res.text());
+      } catch (err) {
+        logger.warn("worker", `update check failed: ${err.message}`);
+        return;
+      }
+      if (!latestBuildDate || latestBuildDate === runningBuildDate) return;
+
+      logger.info("worker", `new build detected (${runningBuildDate} -> ${latestBuildDate}) - reloading to pick it up`);
+      try {
+        sessionStorage.setItem(AUTO_RESUME_SESSION_KEY, JSON.stringify({ publicConfig, secretConfig }));
+      } catch (err) {
+        logger.warn("worker", `couldn't stash auto-resume state (${err.message}) - reloading to the setup screen instead`);
+      }
+      location.reload();
+    }, UPDATE_CHECK_INTERVAL_MS);
+  }
+
   logger.info("worker", `started as ${transport.identity.npub}`);
 }
 
@@ -1100,7 +1154,45 @@ function readSetupForm() {
   return { publicConfig, secretConfig };
 }
 
+async function activateDashboard(publicConfig, secretConfig) {
+  await startWorker(publicConfig, secretConfig);
+  document.getElementById("setup-screen").hidden = true;
+  document.getElementById("dashboard-screen").hidden = false;
+}
+
+/**
+ * Consumes (single-use) the sessionStorage note a self-triggered reload
+ * left for itself - see UPDATE_CHECK_INTERVAL_MS's own comment. Returns
+ * whether it actually found and used one, so main() knows whether to fall
+ * back to the normal setup screen.
+ */
+async function tryAutoResume() {
+  let raw;
+  try {
+    raw = sessionStorage.getItem(AUTO_RESUME_SESSION_KEY);
+    if (raw) sessionStorage.removeItem(AUTO_RESUME_SESSION_KEY);
+  } catch {
+    return false; // sessionStorage unavailable (private-browsing edge cases) - nothing to resume from
+  }
+  if (!raw) return false;
+
+  try {
+    const { publicConfig, secretConfig } = JSON.parse(raw);
+    await activateDashboard(publicConfig, secretConfig);
+    return true;
+  } catch (err) {
+    console.error("[worker-app] auto-resume failed, falling back to the setup screen:", err);
+    return false;
+  }
+}
+
 function main() {
+  tryAutoResume().then((resumed) => {
+    if (!resumed) renderSetupScreen();
+  });
+}
+
+function renderSetupScreen() {
   const publicConfig = loadPublicConfig();
   const secretConfig = publicConfig.rememberSecrets ? loadSecretConfig() : defaultSecretConfig();
   populateSetupForm(publicConfig, secretConfig);
@@ -1151,9 +1243,7 @@ function main() {
     }
 
     try {
-      await startWorker(publicConfig, secretConfig);
-      document.getElementById("setup-screen").hidden = true;
-      document.getElementById("dashboard-screen").hidden = false;
+      await activateDashboard(publicConfig, secretConfig);
     } catch (err) {
       console.error("[worker-app] failed to start:", err);
       errorEl.textContent = `Failed to start: ${err.message}`;
