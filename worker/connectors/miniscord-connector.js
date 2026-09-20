@@ -1,7 +1,9 @@
-// REST client for miniscord's POST /pokesearch endpoint - replaces AHK
-// typing + Tampermonkey/browser scraping for pokesearch, one call at a
-// time. See miniscord's own docs (pokesearch-api.md) for the full
-// request/response contract this implements.
+// REST client for miniscord - replaces AHK typing + Tampermonkey/browser
+// scraping, one call at a time. Covers POST /pokesearch, POST
+// /questsearch, GET /gyms, GET /unread, and POST /http-relay - see
+// miniscord's own docs (pokesearch-api.md, questsearch-api.md,
+// gyms-api.md, unread-api.md, http-relay-api.md) for each endpoint's full
+// request/response contract.
 //
 // Synchronous request/response, unlike the old scrape-and-later-detect
 // model: the HTTP response IS the complete answer to this exact call, so
@@ -64,14 +66,33 @@ export class MiniscordConnector {
 
   /**
    * Submits `command` (verbatim slash-command text, already shaped/quoted
-   * as miniscord expects) and returns `{ok:true, results:[...]}` or
-   * `{ok:false, error}` - never throws. Exactly one attempt, paced onto
-   * the shared chain; callers own their own retry policy.
+   * as miniscord expects) to POST /pokesearch and returns
+   * `{ok:true, results:[...]}` or `{ok:false, error}` - never throws.
+   * Exactly one attempt, paced onto the shared chain; callers own their
+   * own retry policy.
    * @param {string} command
    * @returns {Promise<{ok:true, results:object[]} | {ok:false, error:string}>}
    */
   search(command) {
-    const run = this.#chain.then(() => this.#doSearch(command));
+    return this.#enqueue("pokesearch", command);
+  }
+
+  /**
+   * Same contract as search(), against POST /questsearch instead - a
+   * separate endpoint, but sharing this connector's own #chain/MIN_GAP_MS
+   * pacing with search() rather than its own independent one: both
+   * ultimately hit the same Discord bot integration, and the whole point
+   * of that pacing is not hammering Discord regardless of which endpoint
+   * a given call happens to be for.
+   * @param {string} command
+   * @returns {Promise<{ok:true, results:object[]} | {ok:false, error:string}>}
+   */
+  searchQuest(command) {
+    return this.#enqueue("questsearch", command);
+  }
+
+  #enqueue(endpoint, command) {
+    const run = this.#chain.then(() => this.#doSearch(endpoint, command));
     // Always pace the next call MIN_GAP_MS after this one settles,
     // regardless of outcome - #doSearch never throws, but this still
     // guards against a failed call skipping the cooldown.
@@ -197,14 +218,14 @@ export class MiniscordConnector {
     }
   }
 
-  async #doSearch(command) {
+  async #doSearch(endpoint, command) {
     const baseUrl = this.#getBaseUrl();
     if (!baseUrl) return { ok: false, error: "miniscord_not_configured" };
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await fetch(`${baseUrl}/pokesearch`, {
+      const res = await fetch(`${baseUrl}/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command }),
@@ -213,15 +234,15 @@ export class MiniscordConnector {
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) {
         const error = data?.error ?? `http_${res.status}`;
-        this.#logger.warn("miniscord", `pokesearch ${JSON.stringify(command)} failed: ${error}`);
+        this.#logger.warn("miniscord", `${endpoint} ${JSON.stringify(command)} failed: ${error}`);
         return { ok: false, error };
       }
       const results = data.results ?? [];
-      this.#logger.info("miniscord", `pokesearch ${JSON.stringify(command)} -> ${results.length} result(s)`);
+      this.#logger.info("miniscord", `${endpoint} ${JSON.stringify(command)} -> ${results.length} result(s)`);
       return { ok: true, results };
     } catch (err) {
       const error = err.name === "AbortError" ? "client_timeout" : "network_error";
-      this.#logger.warn("miniscord", `pokesearch ${JSON.stringify(command)} failed: ${error} (${err.message})`);
+      this.#logger.warn("miniscord", `${endpoint} ${JSON.stringify(command)} failed: ${error} (${err.message})`);
       return { ok: false, error };
     } finally {
       clearTimeout(timer);

@@ -1,5 +1,5 @@
 // The "Validation -> Dedup -> Authoritative State" stages of the processing
-// pipeline. Connectors (Source Feed, AHK, future ones) only ever emit
+// pipeline. Connectors (Source Feed, miniscord, future ones) only ever emit
 // "*.observed" events with normalized-but-untrusted content; this service
 // is the single gate deciding what actually becomes authoritative state -
 // per the architecture brief, connectors must never publish directly.
@@ -30,7 +30,7 @@ const SCAN_POOL_GRACE_MS = 60 * 60_000; // 1 hour
 const RETENTION_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const RETENTION_LAST_RUN_KEY = "retentionTrimLastRunDate";
 
-// Local calendar date, matching ahk-connector.js's own todayKey() (not
+// Local calendar date, matching worker-app.js's own todayKey() (not
 // duplicated as a shared helper - it's three lines, and this file has no
 // other reason to depend on that one).
 function todayKey() {

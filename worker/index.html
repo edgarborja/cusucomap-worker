@@ -6,8 +6,9 @@
 <!--
   The ApplicationWorker page - see worker/README.md for what this is and
   how it fits with the rest of the repo. This tab, once started, is the
-  authoritative CusucoMap backend: it ingests Source Feed/AHK data, maintains
-  current spawn/raid/research state, and publishes to Nostr for viewers.
+  authoritative CusucoMap backend: it ingests Source Feed data and miniscord
+  search results, maintains current spawn/raid/research state, and
+  publishes to Nostr for viewers.
   It is NOT a browser ServiceWorker (see core/logging.js and README for the
   naming distinction the architecture explicitly calls for).
 
@@ -96,7 +97,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-20 06:53 UTC</p>
+    <p id="build-date">Build: 2026-09-20 15:17 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -134,45 +135,32 @@
     </div>
 
     <div class="panel">
-      <h2>AHK</h2>
-      <p>
-        <button id="ahk-toggle" type="button">Enable AHK</button>
-        <span id="ahk-status">Disabled</span>
+      <h2>Scheduled searches</h2>
+      <p class="hint">
+        Loops through the scheduled search list via miniscord, resting between full passes - starts automatically
+        when this page loads. Pausing here also happens automatically for the duration of a quest scan (see below),
+        so the two never interleave on the same miniscord connection.
       </p>
-      <p>Send a one-off command outside the normal schedule:</p>
-      <form id="ahk-form">
-        <input id="ahk-command-input" type="text" placeholder="/pokesearch iv100" />
-        <button type="submit">Send</button>
-      </form>
+      <p>
+        <button id="scheduled-loop-toggle" type="button">Pause</button>
+        <span id="scheduled-loop-status">Running</span>
+      </p>
     </div>
 
     <div class="panel">
-      <h2>Bulk scans</h2>
+      <h2>Quest scan</h2>
       <p class="hint">
-        Runs a full pass of geofilter + search commands over a pasted list of scan-group centers (columns:
-        Latitude, Longitude, Distance in meters, GroupMemberCount - order doesn't matter). Takes priority over
-        daily commands until it finishes or is cancelled.
+        Runs one <code>/questsearch</code> call per row of a pasted list of scan-group centers (columns: Latitude,
+        Longitude, Distance in meters, GroupMemberCount - order doesn't matter), through miniscord, spaced a few
+        seconds apart. Covers both encounter and item rewards in a single call per location - no separate raid scan
+        any more, since <code>/gyms</code> already polls every gym in the area continuously.
       </p>
-
-      <details id="quest-scan-details">
-        <summary>Quest scan</summary>
-        <textarea id="quest-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
-        <p>
-          <button id="quest-scan-start" type="button">Start quest scan</button>
-          <button id="quest-scan-cancel" type="button" hidden>Cancel</button>
-          <span id="quest-scan-status" hidden></span>
-        </p>
-      </details>
-
-      <details id="raid-scan-details">
-        <summary>Raid scan</summary>
-        <textarea id="raid-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
-        <p>
-          <button id="raid-scan-start" type="button">Start raid scan</button>
-          <button id="raid-scan-cancel" type="button" hidden>Cancel</button>
-          <span id="raid-scan-status" hidden></span>
-        </p>
-      </details>
+      <textarea id="quest-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
+      <p>
+        <button id="quest-scan-start" type="button">Start quest scan</button>
+        <button id="quest-scan-cancel" type="button" hidden>Cancel</button>
+        <span id="quest-scan-status" hidden></span>
+      </p>
     </div>
   </section>
 </main>

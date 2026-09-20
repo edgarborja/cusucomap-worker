@@ -1,14 +1,15 @@
 // Parses the operator-pasted CSV of scan-group centers (see worker/
-// index.html's bulk-scan sections) and builds the AHK command sequence for
-// a full quest or raid pass over them, one geofilter-set + search
-// command(s) per group. Column lookup is by header name (case-insensitive,
-// order-independent), not fixed position, so a differently-ordered export
-// of the same shape still works - the only real requirement is Latitude/
-// Longitude/Distance columns existing somewhere in the header.
+// index.html's Quest scan section) into per-location {lat, lon, radiusKm}
+// groups - worker-app.js's own wireQuestScanSection turns each into one
+// miniscord POST /questsearch call (see core/miniscord-questsearch.js).
+// Column lookup is by header name (case-insensitive, order-independent),
+// not fixed position, so a differently-ordered export of the same shape
+// still works - the only real requirement is Latitude/Longitude/Distance
+// columns existing somewhere in the header.
 //
 // Distance is in *meters* (this is what the grouping tool that produces
-// this CSV emits) - the AHK geofilter command's radius: parameter is in
-// kilometers, so every row's Distance gets divided by 1000 here.
+// this CSV emits), so every row's Distance gets divided by 1000 here to
+// match the km radius miniscord's own commands expect.
 const REQUIRED_COLUMNS = ["latitude", "longitude", "distance"];
 
 /** @returns {Record<string, number> | null} column name -> index, or null if a required column is missing. */
@@ -54,22 +55,4 @@ export function parseScanGroupsCsv(csvText) {
     groups.push({ lat, lon, radiusKm: (distanceMeters / 1000).toFixed(5) });
   }
   return { groups, errors };
-}
-
-// The geofilter commands are real Discord slash commands with two named
-// parameters (center, radius) - a plain space between them just becomes
-// part of the center value's own text, it doesn't move to the next
-// parameter field. A literal Tab character does, so http_send.ahk's
-// TypeIt sends a real {Tab} keypress whenever it hits one, rather than
-// typing it as text (see that file's Chars loop).
-const PARAM_SEPARATOR = "\t";
-
-/** @param {{lat: string, lon: string, radiusKm: string}} group */
-export function buildQuestGroupCommands({ lat, lon, radiusKm }) {
-  return [`/questset geofilter center:${lat},${lon}${PARAM_SEPARATOR}radius:${radiusKm}`, "/questsearch encounter", "/questsearch item"];
-}
-
-/** @param {{lat: string, lon: string, radiusKm: string}} group */
-export function buildRaidGroupCommands({ lat, lon, radiusKm }) {
-  return [`/raidset geofilter center:${lat},${lon}${PARAM_SEPARATOR}radius:${radiusKm}`, "/raidsearch hatched"];
 }

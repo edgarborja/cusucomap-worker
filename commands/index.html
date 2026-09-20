@@ -1,24 +1,26 @@
 <meta charset="utf-8" />
-<title>CusucoMap Worker - AHK Commands</title>
+<title>CusucoMap Worker - Commands</title>
 <link rel="icon" href="data:," />
 <link rel="stylesheet" href="../worker/style.css" />
 <link rel="stylesheet" href="./style.css" />
 
 <!--
-  Standalone page - edits the scheduled/daily AHK command lists on an
-  already-running worker tab, over the same encrypted Nostr RPC channel
-  worker/transports/rpc.js already serves (see getAhkCommands/setAhkCommands
-  in worker/worker-app.js). No server of its own: this page talks directly
-  to relays, exactly like worker/index.html does.
+  Standalone page - edits the miniscord-driven scheduled search loop's
+  filter list, triggers a one-off area scan, and manages scan subscribers
+  on an already-running worker tab, over the same encrypted Nostr RPC
+  channel worker/transports/rpc.js already serves (see
+  getScheduledSearches/setScheduledSearches in worker/worker-app.js). No
+  server of its own: this page talks directly to relays, exactly like
+  worker/index.html does.
 
   Nothing here works unless the worker tab this NSEC belongs to is
-  currently open and connected - both RPC methods require it (see
-  worker-app.js's self-pubkey check on both handlers).
+  currently open and connected - every RPC method requires it (see
+  worker-app.js's self-pubkey check on each handler).
 -->
 
 <main id="app">
   <header class="topbar">
-    <h1>AHK Commands</h1>
+    <h1>Commands</h1>
     <span id="worker-npub" class="npub" hidden></span>
   </header>
 
@@ -51,12 +53,6 @@
       <h2>Scheduled loop <span class="hint">(runs in order, repeats)</span></h2>
       <ul id="scheduled-list" class="command-list"></ul>
       <button id="add-scheduled" type="button">+ Add command</button>
-    </div>
-
-    <div class="panel">
-      <h2>Daily commands <span class="hint">(each fires once per day, near the time shown)</span></h2>
-      <ul id="daily-list" class="command-list"></ul>
-      <button id="add-daily" type="button">+ Add daily command</button>
     </div>
 
     <p>

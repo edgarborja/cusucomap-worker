@@ -8,12 +8,14 @@
 // importing nostr-tools itself, so the exact same logic works from a
 // browser page loading the pinned CDN bundle (window.NostrTools, see
 // worker/index.html) and from a plain Node script using the npm package
-// (see tools/set-ahk-commands.mjs) - the two environments load the library
-// completely differently, but its exported shape is identical either way.
+// (see tools/set-scheduled-searches.mjs) - the two environments load the
+// library completely differently, but its exported shape is identical
+// either way.
 //
 // Built specifically for *self*-RPC: a caller who holds the worker's own
 // nsec, calling a method the worker only accepts from itself (see
-// worker-app.js's getAhkCommands/setAhkCommands handlers) - `pubkeyHex` is
+// worker-app.js's getScheduledSearches/setScheduledSearches handlers) -
+// `pubkeyHex` is
 // used both as the encryption recipient and as the "#p" filter for the
 // response, since for this use case sender and recipient are the same
 // identity. Not meant as a general viewer-facing RPC client.

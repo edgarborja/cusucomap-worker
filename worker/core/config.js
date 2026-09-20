@@ -48,10 +48,9 @@ export function defaultPublicConfig() {
 }
 
 /**
- * Search scheduling config, shared between AhkConnector (daily commands,
- * quest-scan/raid-scan - still real keystrokes) and worker-app.js's own
- * miniscord-driven scheduled loop (scheduledSearches below - a REST call,
- * no browser/AHK involved). Deliberately NOT part of
+ * Search scheduling config for worker-app.js's own miniscord-driven
+ * scheduled loop and scan features - a REST call, no browser/AHK involved
+ * (AHK itself has been fully retired). Deliberately NOT part of
  * PublicConfig/persisted to localStorage - there's no setup-screen field
  * that ever lets the operator edit this, so routing it through saved
  * config only meant a stale copy could silently outlive a code update
@@ -60,15 +59,15 @@ export function defaultPublicConfig() {
  * directly wherever needed instead, so it's just page code - a plain
  * reload always picks up the current value, no persistence layer involved.
  */
-export function defaultAhkConfig() {
+export function defaultSearchConfig() {
   return {
     // Each entry is a filter (no location of its own) - run through
     // miniscord with defaultSearchCenterLat/Lon/RadiusKmText below appended,
     // one at a time, resting batchRestMinMin/MaxMin between full passes.
-    // Storage/editing still goes through AhkConnector's own
-    // getCommands/applyCommands (see commands/commands-app.js) even though
-    // AHK itself no longer sends these - it's just the established,
-    // admin-edited source of truth for this list.
+    // Storage/editing goes through core/scheduled-searches.js (see
+    // commands/commands-app.js) - this is just the fallback a worker that's
+    // never had a list explicitly set yet falls back to, and what the seed
+    // script publishes on first run.
     scheduledSearches: [
       "/pokesearch iv100",
       "/pokesearch iv95",
@@ -82,29 +81,9 @@ export function defaultAhkConfig() {
       "/pokesearch lvl35",
       "/pokesearch lvl31 iv65",
     ],
-    // Still used for daily commands and quest-scan/raid-scan's own AHK
-    // pacing - unrelated to the miniscord-routed scheduledSearches above,
-    // which uses MiniscordConnector's own built-in pacing instead.
-    searchPauseMinS: 8,
-    searchPauseMaxS: 15,
-    // Rest between full passes of scheduledSearches, regardless of transport.
+    // Rest between full passes of scheduledSearches.
     batchRestMinMin: 2,
     batchRestMaxMin: 3,
-    // Fallback only - both scheduledSearches above and dailyCommands below
-    // are actually owned by ahk-connector.js's getCommands/applyCommands
-    // once anything's been set via the setAhkCommands RPC method (see
-    // commands/commands-app.js and tools/set-ahk-commands.mjs); these
-    // hardcoded values are just what a worker that's never had commands set
-    // yet falls back to, and what the seed script publishes on first run.
-    // Every daily command always gets Enter pressed twice (a real Discord
-    // slash command, unlike a plain "/pokesearch ..." reply - the first
-    // Enter only accepts the autocomplete/subcommand selection, it doesn't
-    // submit) and the same fixed jitter window - see ahk-connector.js's
-    // DAILY_COMMAND_JITTER_MINUTES/#checkDailyCommands.
-    dailyCommands: [
-      { message: "/questset addchannel", hour: 23, minute: 0 },
-      { message: "/raidset addchannel", hour: 4, minute: 0 },
-    ],
     // How many area/species scans a single "cusuco" scan subscriber (see
     // worker-app.js's runAreaScan and the commands page's "Scan subscribers"
     // panel) can run per calendar day - shared across scan types, not one

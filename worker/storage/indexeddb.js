@@ -54,7 +54,7 @@ const STORE_DEFS = {
   // request); approveScanResults already prefers a non-empty note over
   // attributionTag.
   // dailyLimit (null/absent = use scanDailyLimitPerSubscriber, the
-  // fleet-wide default in defaultAhkConfig()) lets the operator grant a
+  // fleet-wide default in defaultSearchConfig()) lets the operator grant a
   // specific subscriber more (or fewer) scans/day than everyone else -
   // set via the commands page's admin panel, read by
   // resolveSubscriberDailyLimit (worker-app.js), which both

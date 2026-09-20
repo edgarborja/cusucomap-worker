@@ -185,10 +185,7 @@ class ScanSubscriberStore {
 class PendingScanPoolStore {
   #collection;
   // Serializes appendSpawn calls - see that method's own comment for why
-  // this exists. Not per-scanId: only one bulk scan can ever be active at
-  // a time (AhkConnector's own #bulkScanActive guard), so there is never
-  // more than one pool being appended to concurrently anyway - one shared
-  // chain is enough.
+  // this exists. Not per-scanId - a single shared chain across every pool.
   #appendChain = Promise.resolve();
   constructor(collection) {
     this.#collection = collection;

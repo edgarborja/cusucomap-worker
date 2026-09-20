@@ -5,10 +5,11 @@
 // own spawn detail badges), one notification even if several match.
 // spawn.created events are debounced into short batches (see
 // BATCH_DEBOUNCE_MS) before matching runs, rather than notified one at a
-// time - in practice this groups "everything one AHK search command's
-// reply(ies) turned up" into a single combined notification per device
-// instead of one per spawn, without needing to track which command sent
-// what. Evaluated against IndexedDB subscriptions, sent via
+// time - in practice this groups everything that lands within a short
+// window (one miniscord search's whole result set, or several people
+// posting sightings in a tracked channel close together) into a single
+// combined notification per device instead of one per spawn. Evaluated
+// against IndexedDB subscriptions, sent via
 // services/push-sender.js (Web Push) or
 // services/fcm-sender.js (FCM), both through the same PushTransport
 // bridge, instead of the `web-push`/`firebase-admin` npm packages.
@@ -42,18 +43,17 @@ function normalize(text) {
 // spawn itself.
 const MIN_REMAINING_MS_TO_NOTIFY = 5 * 60_000;
 
-// Spawns from one AHK search command (however many Discord messages its
-// results spanned - a /pokesearch reply over 4 results continues into a
-// second, headerless message) arrive at the worker in a tight cluster;
-// spawns from a *different* command are always separated by at least the
-// shortest inter-command settle pause AHK still uses (see
-// ahk-connector.js's searchPauseMinS - only daily commands and
-// quest-scan/raid-scan send through AHK at all now, pokesearch having
-// moved to miniscord) plus scrape/network latency. Debouncing
-// spawn.created on a window shorter than that pacing floor is what groups
-// "one command's results" into one notification without needing to
-// correlate against ahk.command-sent directly. MAX_WAIT bounds a batch
-// that somehow never goes quiet (continuous activity) to a hard ceiling.
+// Spawns from one miniscord search (however many the response held) all
+// get emitted in the same tick, so they're already naturally grouped
+// before debouncing ever comes into play; a *different* search is always
+// separated by at least MiniscordConnector's own MIN_GAP_MS pacing floor.
+// The case this debounce window actually matters for is organic Source
+// Feed scraping, where more than one person can post a sighting in a
+// tracked channel within a couple seconds of each other - grouping those
+// into one combined notification instead of one per spawn, without
+// needing to correlate anything against who posted what. MAX_WAIT bounds
+// a batch that somehow never goes quiet (continuous activity) to a hard
+// ceiling.
 const BATCH_DEBOUNCE_MS = 2_000;
 const BATCH_MAX_WAIT_MS = 6_000;
 // How many individual spawns to name in a combined notification's body

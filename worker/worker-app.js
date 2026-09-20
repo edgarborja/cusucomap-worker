@@ -6,23 +6,24 @@
 import { EventBus } from "./core/event-bus.js";
 import { Logger } from "./core/logging.js";
 import { createApplicationState } from "./core/application-state.js";
-import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig, clearPersistedSecrets, defaultAhkConfig, defaultSecretConfig } from "./core/config.js";
+import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig, clearPersistedSecrets, defaultSearchConfig, defaultSecretConfig } from "./core/config.js";
 import { NostrTransport } from "./transports/nostr-transport.js";
 import { Rpc } from "./transports/rpc.js";
 import { MiniscordPushTransport } from "./transports/push-transport.js";
-import { AhkTransport } from "./transports/ahk-transport.js";
 import { SourceFeedConnector } from "./connectors/source-feed-connector.js";
-import { AhkConnector } from "./connectors/ahk-connector.js";
 import { MiniscordConnector } from "./connectors/miniscord-connector.js";
 import { WatchChannelConnector } from "./connectors/watch-channel-connector.js";
 import { buildSpawnFromMiniscordRecord } from "./core/miniscord-spawn.js";
 import { buildMiniscordPokesearchCommand } from "./core/miniscord-pokesearch.js";
 import { buildRaidFromGym, gymLocationKey } from "./core/miniscord-gym.js";
+import { loadScheduledSearches, saveScheduledSearches, validateScheduledSearches } from "./core/scheduled-searches.js";
 import { PokemonStateService } from "./services/pokemon-state.js";
 import { AccountsService } from "./services/accounts.js";
 import { NotificationsService } from "./services/notifications.js";
 import { startDashboard } from "./dashboard/dashboard.js";
-import { parseScanGroupsCsv, buildQuestGroupCommands, buildRaidGroupCommands } from "./core/scan-groups.js";
+import { parseScanGroupsCsv } from "./core/scan-groups.js";
+import { buildMiniscordQuestsearchCommand } from "./core/miniscord-questsearch.js";
+import { buildQuestFromMiniscordRecord } from "./core/miniscord-quest.js";
 import { generateHexLattice, buildAreaScanCommand, buildSubscriberAreaScanCommand } from "./core/area-scan.js";
 import { isValidDexNumber, buildSpeciesScanCommand } from "./core/species-scan.js";
 import { exportAllData } from "./storage/indexeddb.js";
@@ -52,6 +53,48 @@ function getRenderedBuildDate() {
   return document.getElementById("build-date")?.textContent ?? null;
 }
 
+/**
+ * Reference-counted pause/resume, keyed by an arbitrary reason string -
+ * lets more than one independent caller (the dashboard's own manual
+ * toggle, a running quest scan) each hold their own pause without one's
+ * resume() clearing the other's. Used to keep the scheduled pokesearch
+ * loop (see runMiniscordScheduledBatch) from queuing its own calls onto
+ * miniscord's shared pacing chain while something else needs uncontested
+ * use of it. `onChange` fires only on an actual overall paused/not-paused
+ * transition, not on every pause()/resume() call - a caller adding a
+ * reason that was already covered by another one is a no-op for the UI.
+ */
+function createPauseGate(onChange) {
+  const reasons = new Set();
+  let waiters = [];
+  const isPaused = () => reasons.size > 0;
+  return {
+    isPaused,
+    reasons: () => [...reasons],
+    pause(reason) {
+      if (reasons.has(reason)) return;
+      const wasPaused = isPaused();
+      reasons.add(reason);
+      if (!wasPaused) onChange?.();
+    },
+    resume(reason) {
+      if (!reasons.has(reason)) return;
+      reasons.delete(reason);
+      if (!isPaused()) {
+        const toRelease = waiters;
+        waiters = [];
+        for (const resolve of toRelease) resolve();
+        onChange?.();
+      }
+    },
+    /** Resolves immediately if not currently paused, otherwise once every reason has been resume()'d. */
+    waitIfPaused() {
+      if (!isPaused()) return Promise.resolve();
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
 function extractBuildDate(html) {
   return html.match(/id="build-date">([^<]*)<\/p>/)?.[1] ?? null;
 }
@@ -63,8 +106,8 @@ function parseLines(text) {
     .filter(Boolean);
 }
 
-// Local calendar date - matches ahk-connector.js's own todayKey() and
-// pokemon-state.js's own copy; not worth a shared helper for three lines.
+// Local calendar date - matches pokemon-state.js's own copy; not worth a
+// shared helper for three lines.
 function todayKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -99,111 +142,29 @@ function wireNostrPublishing(bus, transport, logger) {
   }
 }
 
-const AHK_ENABLE_GRACE_MS = 5_000;
-
-/**
- * Wires the dashboard's "Enable/Disable AHK" toggle. Starts disabled by
- * design (see worker/index.html's ahk-toggle button and this repo's own
- * incident where scheduled AHK commands silently overwrote the operator's
- * clipboard on their own timer) - AhkConnector.start()/stop() themselves
- * have no concept of "disabled by default" or a grace period, that's a
- * UI/operator-workflow concern owned entirely here, not connector business
- * logic. Enabling waits AHK_ENABLE_GRACE_MS before actually starting, so
- * there's time to alt-tab into the Source Feed window - the AHK script still
- * needs it focused to simulate keystrokes correctly, same as the old
- * clipboard-paste path did. Clicking again during the countdown cancels it.
- * @returns {{ isEnabled: () => boolean, enableThenRun: (syncCallback: () => unknown) => Promise<unknown> }}
- */
-function wireAhkControls({ ahkConnector, logger }) {
-  const toggleButton = document.getElementById("ahk-toggle");
-  const statusEl = document.getElementById("ahk-status");
-  let enabled = false;
-  let countdownTimer = null;
-  let cancelCurrentEnable = null;
-
-  function setDisabled() {
-    clearTimeout(countdownTimer);
-    countdownTimer = null;
-    cancelCurrentEnable?.();
-    cancelCurrentEnable = null;
-    if (enabled) ahkConnector.stop();
-    enabled = false;
-    toggleButton.textContent = "Enable AHK";
-    statusEl.textContent = "Disabled";
-  }
-
-  /**
-   * Enables AHK if it isn't already (running the same grace-period
-   * countdown as before), then calls `syncCallback` and resolves/rejects
-   * with its result - used directly by the toggle button (with a no-op
-   * callback) and by the quest-scan/raid-scan bulk-scan buttons (see
-   * wireBulkScanSection), which need their scan to claim priority the
-   * instant AHK starts rather than race anything else queuing onto its
-   * chain for it. That guarantee is *why* `syncCallback` is invoked
-   * synchronously, in the same tick as ahkConnector.start(), rather than
-   * via a caller separately awaiting a resolved promise and calling it
-   * after - going through even one extra `await` before calling it would
-   * leave a window for something else to queue first (see
-   * AhkConnector#runBulkScan's own "no await gap" reasoning for the same
-   * class of bug, fixed the same way here).
-   * @param {() => unknown} syncCallback
-   */
-  function enableThenRun(syncCallback) {
-    if (enabled) return Promise.resolve(syncCallback());
-    if (countdownTimer) return Promise.reject(new Error("Already enabling AHK - wait for that to finish first."));
-
-    return new Promise((resolve, reject) => {
-      const startedAt = Date.now();
-      toggleButton.textContent = "Cancel";
-      let cancelled = false;
-      cancelCurrentEnable = () => {
-        cancelled = true;
-      };
-      const tick = () => {
-        if (cancelled) {
-          reject(new Error("Enabling AHK was cancelled."));
-          return;
-        }
-        const remainingS = Math.max(0, Math.ceil((AHK_ENABLE_GRACE_MS - (Date.now() - startedAt)) / 1000));
-        if (remainingS <= 0) {
-          countdownTimer = null;
-          cancelCurrentEnable = null;
-          enabled = true;
-          ahkConnector.start();
-          toggleButton.textContent = "Disable AHK";
-          statusEl.textContent = "Enabled";
-          logger.info("ahk", "AHK enabled - sending daily/manual commands and quest-scan/raid-scan.");
-          resolve(syncCallback());
-          return;
-        }
-        statusEl.textContent = `Starting in ${remainingS}s - switch to the Source Feed window now`;
-        countdownTimer = setTimeout(tick, 250);
-      };
-      tick();
-    });
-  }
-
-  toggleButton.addEventListener("click", () => {
-    if (enabled || countdownTimer) setDisabled();
-    else enableThenRun(() => {}).catch(() => {}); // errors are already reflected in statusEl above
-  });
-
-  setDisabled();
-  return { isEnabled: () => enabled, enableThenRun };
-}
-
 // Not a secret - just pasted scan-group coordinates - so this persists
 // unconditionally, unlike the commands page's opt-in-only NSEC storage.
 const SCAN_CSV_STORAGE_PREFIX = "cusucomap-worker:scan-csv:";
 
 /**
- * Wires one bulk-scan <details> section (see index.html's quest-scan/
- * raid-scan id groups) - shared between both sections since they're
- * identical apart from which command-builder they use.
- * @param {string} id - "quest-scan" or "raid-scan".
- * @param {(location: object) => string[]} buildRowCommands
+ * Wires the "Quest scan" section (see index.html) - loops the pasted CSV
+ * of scan-group centers through one miniscord POST /questsearch call per
+ * location (see core/miniscord-questsearch.js's own comment for why this
+ * is a single un-filtered call, not the old AHK path's geofilter-set plus
+ * two type-filtered /questsearch commands per location). No more raid-scan
+ * counterpart - /gyms already polls every gym in the configured area
+ * continuously, so there's nothing left for a per-location bulk scan to do
+ * for raids.
+ *
+ * Pauses the scheduled pokesearch loop (scheduledLoopGate, "quest-scan"
+ * reason) for the scan's own duration - without this, the scheduled
+ * loop's own calls interleave with the quest scan's on the same shared
+ * miniscord pacing chain, slowing both down for no benefit. Always
+ * resumed in the finally block below, whether the scan finished, failed,
+ * or was cancelled.
  */
-function wireBulkScanSection(id, buildRowCommands, { ahkConnector, ahkControls, logger }) {
+function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor, scheduledLoopGate, bus, logger }) {
+  const id = "quest-scan";
   const textarea = document.getElementById(`${id}-csv`);
   const startButton = document.getElementById(`${id}-start`);
   const cancelButton = document.getElementById(`${id}-cancel`);
@@ -224,43 +185,56 @@ function wireBulkScanSection(id, buildRowCommands, { ahkConnector, ahkControls, 
     }
   });
 
+  let cancelRequested = false;
+
   startButton.addEventListener("click", async () => {
     const { groups, errors } = parseScanGroupsCsv(textarea.value);
-    for (const err of errors) logger.warn("ahk", `${id}: ${err}`);
+    for (const err of errors) logger.warn("miniscord", `${id}: ${err}`);
     if (groups.length === 0) {
-      logger.warn("ahk", `${id}: nothing to scan - paste the group list first.`);
+      logger.warn("miniscord", `${id}: nothing to scan - paste the group list first.`);
       return;
     }
-    const enableNotice = ahkControls.isEnabled() ? "" : " AHK is currently disabled, so this will enable it first (same 5s grace period as the toggle button).";
-    if (!confirm(`Start a scan over ${groups.length} groups? This takes priority over daily commands and the watch-channel's clear-unread hotkey until it finishes.${enableNotice}`)) return;
+    if (!miniscordConnector.isConfigured()) {
+      logger.warn("miniscord", `${id}: miniscord isn't configured - set the Miniscord URL first.`);
+      return;
+    }
+    if (!confirm(`Start a quest scan over ${groups.length} groups? Each location is a separate miniscord call, spaced a few seconds apart.`)) return;
 
+    cancelRequested = false;
     startButton.hidden = true;
     cancelButton.hidden = false;
     statusEl.hidden = false;
-    statusEl.textContent = "Starting…";
 
+    scheduledLoopGate.pause("quest-scan");
+    let sent = 0;
     try {
-      // enableThenRun (not just checking isEnabled()) is what makes this
-      // scan take actual priority when AHK was off: it enables AHK and
-      // starts the scan in the same tick, so the scan claims the send
-      // queue before the freshly-started scheduled batch gets a chance to
-      // queue anything - see that function's own comment for why.
-      const result = await ahkControls.enableThenRun(() =>
-        ahkConnector.runBulkScan(groups, buildRowCommands, (sent, total) => {
-          statusEl.textContent = `Sending ${sent}/${total}…`;
-        })
-      );
-      statusEl.textContent = result.cancelled ? `Cancelled after ${result.sent}/${result.total}.` : `Done - sent ${result.sent} commands.`;
+      for (const group of groups) {
+        if (cancelRequested) break;
+        statusEl.textContent = `Sending ${sent}/${groups.length}…`;
+        const command = buildMiniscordQuestsearchCommand(`${group.lat},${group.lon}`, `${group.radiusKm}km`);
+        const result = await miniscordConnector.searchQuest(command);
+        if (result.ok) {
+          const built = await Promise.all(result.results.map((record) => buildQuestFromMiniscordRecord(record, speciesCache, getGeofilterAnchor())));
+          for (const quest of built.filter(Boolean)) bus.emit("quest.observed", quest);
+        } else {
+          logger.warn("miniscord", `${id}: group ${group.lat},${group.lon} failed: ${result.error}`);
+        }
+        sent++;
+      }
+      statusEl.textContent = cancelRequested ? `Cancelled after ${sent}/${groups.length}.` : `Done - sent ${sent} group(s).`;
     } catch (err) {
-      logger.error("ahk", `${id} failed: ${err.message}`);
+      logger.error("miniscord", `${id} failed: ${err.message}`);
       statusEl.textContent = `Failed: ${err.message}`;
     } finally {
+      scheduledLoopGate.resume("quest-scan");
       startButton.hidden = false;
       cancelButton.hidden = true;
     }
   });
 
-  cancelButton.addEventListener("click", () => ahkConnector.cancelBulkScan());
+  cancelButton.addEventListener("click", () => {
+    cancelRequested = true;
+  });
 }
 
 /** Re-broadcasts everything currently active on startup - a relay that pruned an entity while the worker was offline (or a newly-added relay with no history at all) still converges to the correct current state. */
@@ -308,18 +282,14 @@ async function startWorker(publicConfig, secretConfig) {
   });
   sourceFeedConnector.start();
 
-  const ahkTransport = new AhkTransport();
-  const ahkConnector = new AhkConnector({ bus, logger, state, getConfig: defaultAhkConfig, ahkTransport });
-  const ahkControls = wireAhkControls({ ahkConnector, logger });
-
-  // Replaces AHK/the browser/Tampermonkey for every pokesearch command -
-  // scheduled searches, the watch-channel's special search, and both the
-  // operator's own (self) and a subscriber's area/species scan - see
+  // Replaces AHK/the browser/Tampermonkey for every pokesearch/questsearch
+  // command - scheduled searches, the watch-channel's special search, both
+  // the operator's own (self) and a subscriber's area/species scan, and
+  // the quest scan (see wireQuestScanSection) - see
   // worker/connectors/miniscord-connector.js and the
   // "project_scan_feature_v1_hexlattice" memory for the earlier
-  // dedicated-second-tab design this superseded. Daily commands and
-  // quest-scan/raid-scan still go through AHK - miniscord has no
-  // equivalent endpoint for those yet.
+  // dedicated-second-tab design this superseded. AHK itself has been fully
+  // retired.
   const miniscordConnector = new MiniscordConnector({ getBaseUrl: () => publicConfig.miniscordUrl, logger });
   // Same cache backing (and key prefix) as source-feed-connector.js's own
   // speciesCache - shares resolved PokeAPI lookups across both paths
@@ -329,8 +299,7 @@ async function startWorker(publicConfig, secretConfig) {
     set: (key, value) => state.workerMetadata.set(`speciesResolverCache:${key}`, value),
   };
 
-  // Inclusive on both ends - mirrors AhkConnector's own private helper of
-  // the same name, used the same way (jittering a rest interval).
+  // Inclusive on both ends - jitters a rest interval.
   function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
@@ -370,19 +339,42 @@ async function startWorker(publicConfig, secretConfig) {
     return command.replace(/^\/pokesearch\s+/, "");
   }
 
-  // Runs scheduledSearches (see AhkConnector#getCommands - still the
-  // admin-edited source of truth, just no longer sent via AHK) through
-  // miniscord one at a time, resting batchRestMinMin/MaxMin minutes
-  // between full passes - mirrors AhkConnector's own former
-  // #runScheduledBatch shape, just a different transport. Runs
-  // independently of the "Enable AHK" toggle - it never touches AHK.
+  // Reflects scheduledLoopGate's own paused/running state on the
+  // dashboard - see wireScheduledLoopControls for the toggle button this
+  // pairs with, and createPauseGate's own comment for why quest-scan
+  // holds its own independent pause reason here too (see
+  // wireQuestScanSection).
+  function refreshScheduledLoopStatus() {
+    const statusEl = document.getElementById("scheduled-loop-status");
+    const toggleButton = document.getElementById("scheduled-loop-toggle");
+    if (!statusEl || !toggleButton) return;
+    if (scheduledLoopGate.isPaused()) {
+      statusEl.textContent = `Paused (${scheduledLoopGate.reasons().join(", ")})`;
+      toggleButton.textContent = "Resume";
+    } else {
+      statusEl.textContent = "Running";
+      toggleButton.textContent = "Pause";
+    }
+  }
+  const scheduledLoopGate = createPauseGate(refreshScheduledLoopStatus);
+
+  // Runs scheduledSearches (see core/scheduled-searches.js - the
+  // admin-edited source of truth, edited via the commands page or
+  // tools/set-scheduled-searches.mjs) through miniscord one at a time,
+  // resting batchRestMinMin/MaxMin minutes between full passes. Starts
+  // automatically (see the unconditional call below) and checks
+  // scheduledLoopGate before every command, not just at the top of a
+  // pass, so a pause mid-pass takes effect before the next send rather
+  // than waiting for the current pass to finish.
   let scheduledLoopGeneration = 0;
   async function runMiniscordScheduledBatch(generation) {
     if (miniscordConnector.isConfigured()) {
-      const { scheduledSearches } = await ahkConnector.getCommands();
-      const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultAhkConfig();
+      const scheduledSearches = await loadScheduledSearches(state, defaultSearchConfig().scheduledSearches);
+      const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultSearchConfig();
       for (const entry of scheduledSearches) {
         if (generation !== scheduledLoopGeneration) return;
+        await scheduledLoopGate.waitIfPaused();
+        if (generation !== scheduledLoopGeneration) return; // re-check - could have been stopped while waiting
         const command = buildMiniscordPokesearchCommand(
           stripPokesearchPrefix(entry),
           `${defaultSearchCenterLat.toFixed(6)},${defaultSearchCenterLon.toFixed(6)}`,
@@ -393,10 +385,16 @@ async function startWorker(publicConfig, secretConfig) {
       }
     }
     if (generation !== scheduledLoopGeneration) return;
-    const { batchRestMinMin, batchRestMaxMin } = defaultAhkConfig();
+    const { batchRestMinMin, batchRestMaxMin } = defaultSearchConfig();
     setTimeout(() => runMiniscordScheduledBatch(generation), randomInt(batchRestMinMin, batchRestMaxMin) * 60_000);
   }
   runMiniscordScheduledBatch(scheduledLoopGeneration);
+
+  document.getElementById("scheduled-loop-toggle").addEventListener("click", () => {
+    if (scheduledLoopGate.isPaused()) scheduledLoopGate.resume("manual");
+    else scheduledLoopGate.pause("manual");
+  });
+  refreshScheduledLoopStatus();
 
   // Polls miniscord's GET /gyms cache and publishes every gym currently
   // hosting a raid with a known boss - see core/miniscord-gym.js for what
@@ -466,8 +464,7 @@ async function startWorker(publicConfig, secretConfig) {
   notifyWatchChannelActivity = () => watchChannelConnector.notifyMiniscordActivity();
   watchChannelConnector.start();
 
-  wireBulkScanSection("quest-scan", buildQuestGroupCommands, { ahkConnector, ahkControls, logger });
-  wireBulkScanSection("raid-scan", buildRaidGroupCommands, { ahkConnector, ahkControls, logger });
+  wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor: () => publicConfig.geofilterAnchor, scheduledLoopGate, bus, logger });
 
   // secretConfig.fcmServiceAccountJson is fixed for this session (set once
   // at Start Worker time, like vapidPrivateKey/nsec), so parsing it once
@@ -515,19 +512,22 @@ async function startWorker(publicConfig, secretConfig) {
     fieldResearch: await state.fieldResearch.active(),
   }));
   // Both self-pubkey-only (see commands/commands-app.js and
-  // tools/set-ahk-commands.mjs, which sign as the worker's own identity):
-  // this is admin control over what gets typed into the operator's own
-  // Discord session, not something to expose to an arbitrary caller who
+  // tools/set-scheduled-searches.mjs, which sign as the worker's own
+  // identity): this is admin control over the scheduled search loop's own
+  // filter list, not something to expose to an arbitrary caller who
   // merely knows the worker's public npub. Returning {ok:false, ...} here
   // rather than throwing is deliberate - rpc.js's #dispatch collapses any
   // thrown error into a generic "Internal error" message.
-  rpc.handle("getAhkCommands", async (_params, { fromPubkey }) => {
+  rpc.handle("getScheduledSearches", async (_params, { fromPubkey }) => {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
-    return { ok: true, ...(await ahkConnector.getCommands()) };
+    return { ok: true, scheduledSearches: await loadScheduledSearches(state, defaultSearchConfig().scheduledSearches) };
   });
-  rpc.handle("setAhkCommands", async (params, { fromPubkey }) => {
+  rpc.handle("setScheduledSearches", async (params, { fromPubkey }) => {
     if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
-    return ahkConnector.applyCommands(params ?? {});
+    const error = validateScheduledSearches(params?.scheduledSearches);
+    if (error) return { ok: false, error };
+    await saveScheduledSearches(state, params.scheduledSearches);
+    return { ok: true, scheduledSearches: params.scheduledSearches };
   });
   // A subscriber's own dailyLimit (set via setScanSubscriber's admin panel
   // field) overrides the fleet-wide default - absent/null means "use the
@@ -535,7 +535,7 @@ async function startWorker(publicConfig, secretConfig) {
   // checkScanSubscription's own cusucosRemaining can never drift apart on
   // what "the limit" actually means for a given subscriber.
   function resolveSubscriberDailyLimit(subscriber) {
-    return subscriber?.dailyLimit ?? defaultAhkConfig().scanDailyLimitPerSubscriber;
+    return subscriber?.dailyLimit ?? defaultSearchConfig().scanDailyLimitPerSubscriber;
   }
 
   // Every scan-request rejection goes through this, not a bare `return
@@ -543,7 +543,7 @@ async function startWorker(publicConfig, secretConfig) {
   // log (success is already logged, right before its own ack) is
   // impossible to tell apart from "never arrived at all" when
   // troubleshooting, which is exactly what made two near-simultaneous
-  // requests (one claims the #bulkScanActive mutex, the other gets
+  // requests (one claims a single-scan-at-a-time mutex, the other gets
   // silently rejected by it) look like a dropped request instead of a
   // real, structurally-correct "only one scan at a time" rejection.
   function rejectScanRequest(fromPubkey, method, error) {
@@ -590,8 +590,7 @@ async function startWorker(publicConfig, secretConfig) {
    * attribute after the fact the way the old DOM-scraped/dedicated-tab
    * design needed extensive machinery for (see the
    * "project_scan_feature_v1_hexlattice" memory for that history).
-   * Doesn't touch AHK at all, so it runs independently of whether AHK is
-   * enabled/disabled and never contends with its own scheduling.
+   * Doesn't touch AHK at all - that stack has been fully retired.
    *
    * On exhausted retries: reimburses the caller's cusuco and marks the pool
    * "failed" rather than leaving it looking like a genuine zero-result scan
@@ -700,7 +699,7 @@ async function startWorker(publicConfig, secretConfig) {
     const auth = await authorizeScanRequest(fromPubkey, "runAreaScan");
     if (!auth.ok) return auth;
 
-    const { subscriberScanRadiusKmText } = defaultAhkConfig();
+    const { subscriberScanRadiusKmText } = defaultSearchConfig();
     // Two entirely different scan shapes past this point - see
     // area-scan.js's own doc comment for why - but both submitted through
     // miniscord now, with no mutex needed between them: the operator's own
@@ -779,7 +778,7 @@ async function startWorker(publicConfig, secretConfig) {
     const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
     if (!auth.ok) return auth;
 
-    const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultAhkConfig();
+    const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultSearchConfig();
     const command = buildSpeciesScanCommand(dexNumber, {
       lat: defaultSearchCenterLat,
       lon: defaultSearchCenterLon,
@@ -1031,19 +1030,6 @@ async function startWorker(publicConfig, secretConfig) {
     pushTransport,
     getConfig: () => publicConfig,
     getVapidPrivateKeyPresent: () => Boolean(secretConfig.vapidPrivateKey),
-  });
-
-  document.getElementById("ahk-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const input = document.getElementById("ahk-command-input");
-    const value = input.value.trim();
-    if (!value) return;
-    if (!ahkControls.isEnabled()) {
-      logger.warn("ahk", "AHK is disabled - click \"Enable AHK\" first.");
-      return;
-    }
-    input.value = "";
-    await ahkConnector.sendCustomCommand(value);
   });
 
   document.getElementById("export-data").addEventListener("click", async () => {

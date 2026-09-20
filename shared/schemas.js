@@ -1,9 +1,10 @@
 // Minimal structural validation for normalized entities flowing through the
 // worker's ingestion pipeline (Normalization -> Validation -> Dedup ->
 // ApplicationState). Deliberately not a full schema library - connectors are
-// untrusted input (Source Feed/AHK markup can and does change shape), so this
-// exists to reject the malformed 10% loudly rather than let `undefined`s
-// and NaNs silently drift into published Nostr events. Field shapes mirror
+// untrusted input (Source Feed markup and miniscord's own parsed replies can
+// and do change shape), so this exists to reject the malformed 10% loudly
+// rather than let `undefined`s and NaNs silently drift into published Nostr
+// events. Field shapes mirror
 // the existing Spawn/Quest/Raid JSON already defined in cusucomap-viewer's src/entities.ts.
 
 /** @returns {string[]} human-readable problems; empty means valid. */

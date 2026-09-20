@@ -1,10 +1,11 @@
 // Talks to an already-running worker tab over the Nostr RPC channel (see
-// worker/transports/rpc.js, and getAhkCommands/setAhkCommands in
-// worker/worker-app.js) - reads/edits its scheduledSearches/dailyCommands
-// lists. No build step, no bundler, same plain-DOM style as worker/
-// worker-app.js. Values go into inputs via .value (never innerHTML string
-// interpolation), which is what keeps arbitrary command text safe to
-// display without any HTML-escaping of its own.
+// worker/transports/rpc.js, and getScheduledSearches/setScheduledSearches
+// in worker/worker-app.js) - reads/edits its scheduledSearches list (the
+// miniscord-driven scheduled search loop's own filters). No build step, no
+// bundler, same plain-DOM style as worker/worker-app.js. Values go into
+// inputs via .value (never innerHTML string interpolation), which is what
+// keeps arbitrary command text safe to display without any HTML-escaping
+// of its own.
 import { callRpc } from "../shared/rpc-client.js";
 
 function nostrTools() {
@@ -71,53 +72,18 @@ function makeScheduledRow(message = "") {
   return li;
 }
 
-function makeDailyRow({ message = "", hour = 0, minute = 0 } = {}) {
-  const li = document.createElement("li");
-  li.className = "command-row";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "command-text";
-  input.placeholder = "/questset addchannel";
-  input.value = message;
-  const time = document.createElement("input");
-  time.type = "time";
-  time.className = "command-time";
-  time.value = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  li.append(input, time, button("✕", () => li.remove()));
-  return li;
-}
-
 function renderScheduled(messages) {
   const list = document.getElementById("scheduled-list");
   list.innerHTML = "";
   for (const message of messages) list.append(makeScheduledRow(message));
 }
 
-function renderDaily(dailyCommands) {
-  const list = document.getElementById("daily-list");
-  list.innerHTML = "";
-  for (const cmd of dailyCommands) list.append(makeDailyRow(cmd));
-}
-
 function readScheduled() {
   return [...document.querySelectorAll("#scheduled-list .command-text")].map((el) => el.value.trim()).filter(Boolean);
 }
 
-function readDaily() {
-  return [...document.querySelectorAll("#daily-list .command-row")]
-    .map((li) => {
-      const message = li.querySelector(".command-text").value.trim();
-      const [hourStr, minuteStr] = li.querySelector(".command-time").value.split(":");
-      return { message, hour: Number(hourStr), minute: Number(minuteStr) };
-    })
-    .filter((cmd) => cmd.message && Number.isInteger(cmd.hour) && Number.isInteger(cmd.minute));
-}
-
 document.getElementById("add-scheduled").addEventListener("click", () => {
   document.getElementById("scheduled-list").append(makeScheduledRow());
-});
-document.getElementById("add-daily").addEventListener("click", () => {
-  document.getElementById("daily-list").append(makeDailyRow());
 });
 
 // Set once Connect succeeds; reused by the Save button below.
@@ -162,7 +128,7 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     pubkeyHex = NT.getPublicKey(secretKey);
     pool = new NT.SimplePool({ enablePing: true, enableReconnect: true });
 
-    const commands = await callSelf("getAhkCommands");
+    const commands = await callSelf("getScheduledSearches");
 
     if (document.getElementById("field-remember").checked) {
       localStorage.setItem(REMEMBER_KEY, JSON.stringify({ nsec, relaysText: document.getElementById("field-relays").value }));
@@ -173,7 +139,6 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     document.getElementById("worker-npub").textContent = NT.nip19.npubEncode(pubkeyHex);
     document.getElementById("worker-npub").hidden = false;
     renderScheduled(commands.scheduledSearches);
-    renderDaily(commands.dailyCommands);
     await refreshScanSubscribers(0);
     document.getElementById("connect-screen").hidden = true;
     document.getElementById("commands-screen").hidden = false;
@@ -431,11 +396,10 @@ document.getElementById("save-button").addEventListener("click", async () => {
   statusEl.hidden = false;
 
   try {
-    const result = await callSelf("setAhkCommands", { scheduledSearches: readScheduled(), dailyCommands: readDaily() });
+    const result = await callSelf("setScheduledSearches", { scheduledSearches: readScheduled() });
     // Re-render from the worker's own confirmed state, not just what was
     // sent - it's the actual source of truth for what's now running.
     renderScheduled(result.scheduledSearches);
-    renderDaily(result.dailyCommands);
     statusEl.textContent = "Saved.";
     setTimeout(() => {
       statusEl.hidden = true;

@@ -29,27 +29,16 @@ export const BRIDGE_EVENTS = {
   // storage, so a Source Feed tab opened before the worker ever sent this still
   // picks up the last-known list instead of starting with none).
   SET_TRACKED_CHANNEL_IDS: "cusuco-worker-bridge:v1:set-tracked-channel-ids",
-  // Page -> bridge: the sidebar dnd-name of the channel to watch for an
-  // unread badge (see watch-channel-connector.js). Same push-on-start /
-  // GM-storage-backed shape as SET_TRACKED_CHANNEL_IDS above.
-  SET_WATCH_CHANNEL_NAME: "cusuco-worker-bridge:v1:set-watch-channel-name",
-  // Bridge -> page: the watched channel's unread badge just went from clear
-  // to set. Edge-triggered bridge-side (see the companion script's
-  // watchChannelAlreadyTriggered) - one event per new badge, not one per poll.
-  WATCH_CHANNEL_ALERT: "cusuco-worker-bridge:v1:watch-channel-alert",
-  // Page -> bridge: POST this text to the operator's local AHK HTTP
-  // listener (see AhkTransport / the companion script's AHK PROTOCOL comment).
-  AHK_SEND_COMMAND: "cusuco-worker-bridge:v1:ahk-send-command",
-  // Bridge -> page: result of an AHK_SEND_COMMAND (matched by requestId).
-  AHK_SEND_RESULT: "cusuco-worker-bridge:v1:ahk-send-result",
-  // Page -> bridge: send this prepared Web Push HTTP request.
-  PUSH_SEND_REQUEST: "cusuco-worker-bridge:v1:push-send-request",
-  // Bridge -> page: result of a PUSH_SEND_REQUEST (matched by requestId).
-  PUSH_SEND_RESULT: "cusuco-worker-bridge:v1:push-send-result",
-  // Page -> bridge / bridge -> page: liveness check for the push bridge (see PushTransport).
-  PUSH_BRIDGE_PING: "cusuco-worker-bridge:v1:push-bridge-ping",
-  PUSH_BRIDGE_PONG: "cusuco-worker-bridge:v1:push-bridge-pong",
 };
+// Retired, worker-side unused as of this comment (each superseded by a
+// miniscord-based replacement - watch-channel polling, the generic
+// /http-relay push transport, and AHK's own full retirement): the
+// companion script may still emit/handle SET_WATCH_CHANNEL_NAME,
+// WATCH_CHANNEL_ALERT, AHK_SEND_COMMAND, AHK_SEND_RESULT,
+// PUSH_SEND_REQUEST, PUSH_SEND_RESULT, PUSH_BRIDGE_PING, and
+// PUSH_BRIDGE_PONG on its own side, but nothing here listens for or sends
+// them any more - worth pruning there too next time that script gets
+// touched.
 
 /**
  * Thin CustomEvent pub/sub, scoped to `window` so it works regardless of
