@@ -24,6 +24,24 @@ const MIN_GAP_MS = 5_500;
 // Timing section) - this is a client-side safety net, not the primary
 // timeout.
 const REQUEST_TIMEOUT_MS = 12_000;
+// Above /http-relay's own documented 15-20s server-side ceiling (see its
+// docs) - a client-side safety net, same reasoning as REQUEST_TIMEOUT_MS.
+const RELAY_REQUEST_TIMEOUT_MS = 25_000;
+
+// /http-relay's own contract (see its docs) uses standard base64, not the
+// base64url variant shared/stable-id.js-adjacent code elsewhere in this
+// repo uses for URL-safe contexts - these are plain btoa/atob, matching
+// what the endpoint actually expects.
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function base64ToText(b64) {
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
 
 export class MiniscordConnector {
   #getBaseUrl;
@@ -130,6 +148,49 @@ export class MiniscordConnector {
     } catch (err) {
       const error = err.name === "AbortError" ? "client_timeout" : "network_error";
       this.#logger.warn("miniscord", `unread check for ${JSON.stringify(idOrName)} failed: ${error} (${err.message})`);
+      return { ok: false, error };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Relays an arbitrary HTTP request through miniscord's own generic
+   * POST /http-relay (see its own docs) - the CORS-bypass mechanism behind
+   * MiniscordPushTransport, replacing the retired Tampermonkey bridge.
+   * Bypasses #chain/MIN_GAP_MS the same way getGyms()/getUnread() do -
+   * this never touches Discord, and pacing an arbitrary relayed request
+   * (a push send, an OAuth token exchange) behind the pokesearch cooldown
+   * would be actively wrong. Never throws.
+   * @param {{url: string, method?: string, headers?: Record<string,string>, body?: Uint8Array|string}} request
+   * @returns {Promise<{ok: true, status: number, responseText: string} | {ok: false, error: string}>}
+   */
+  async relay({ url, method = "POST", headers = {}, body }) {
+    const baseUrl = this.#getBaseUrl();
+    if (!baseUrl) return { ok: false, error: "miniscord_not_configured" };
+
+    const bodyBytes = body === undefined || body === null ? undefined : typeof body === "string" ? new TextEncoder().encode(body) : body;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RELAY_REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${baseUrl}/http-relay`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, method, headers, ...(bodyBytes ? { bodyBase64: bytesToBase64(bodyBytes) } : {}) }),
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        const error = data?.error ?? `http_${res.status}`;
+        this.#logger.warn("miniscord", `http-relay to ${url} failed: ${error}`);
+        return { ok: false, error };
+      }
+      const responseText = data.bodyBase64 ? base64ToText(data.bodyBase64) : "";
+      return { ok: true, status: data.status, responseText };
+    } catch (err) {
+      const error = err.name === "AbortError" ? "client_timeout" : "network_error";
+      this.#logger.warn("miniscord", `http-relay to ${url} failed: ${error} (${err.message})`);
       return { ok: false, error };
     } finally {
       clearTimeout(timer);

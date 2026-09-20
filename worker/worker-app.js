@@ -9,7 +9,7 @@ import { createApplicationState } from "./core/application-state.js";
 import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig, clearPersistedSecrets, defaultAhkConfig, defaultSecretConfig } from "./core/config.js";
 import { NostrTransport } from "./transports/nostr-transport.js";
 import { Rpc } from "./transports/rpc.js";
-import { TampermonkeyPushTransport } from "./transports/push-transport.js";
+import { MiniscordPushTransport } from "./transports/push-transport.js";
 import { AhkTransport } from "./transports/ahk-transport.js";
 import { SourceFeedConnector } from "./connectors/source-feed-connector.js";
 import { AhkConnector } from "./connectors/ahk-connector.js";
@@ -465,7 +465,7 @@ async function startWorker(publicConfig, secretConfig) {
     return fcmConfigCache;
   }
 
-  const pushTransport = new TampermonkeyPushTransport();
+  const pushTransport = new MiniscordPushTransport({ miniscordConnector });
   const notifications = new NotificationsService({
     state,
     bus,

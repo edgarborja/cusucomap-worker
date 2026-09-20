@@ -4,14 +4,14 @@
 // build the wire protocol from scratch" approach for Web Push. Unlike Web
 // Push, FCM needs two network calls: a service-account JWT-bearer OAuth2
 // token exchange (Google's own token endpoint), then the actual v1 send -
-// both go through the same Tampermonkey bridge Web Push already uses (see
-// transports/push-transport.js) to get around CORS, just to a different
-// pair of allowlisted origins (see worker-bridge/
-// cusuco-worker-companion.user.js's isAllowedPushRequest). That's why this
-// file takes a `sendViaBridge` function rather than importing a transport
-// directly - it needs to drive two sequential bridge calls itself, not
-// just build one request object for the caller to send (push-sender.js's
-// shape), but should stay just as decoupled from any specific transport.
+// both go through the same generic relay Web Push already uses (see
+// transports/push-transport.js, backed by miniscord's own POST
+// /http-relay, which has no target-URL allowlist by design - see its
+// docs). That's why this file takes a `sendViaBridge` function rather than
+// importing a transport directly - it needs to drive two sequential relay
+// calls itself, not just build one request object for the caller to send
+// (push-sender.js's shape), but should stay just as decoupled from any
+// specific transport.
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";

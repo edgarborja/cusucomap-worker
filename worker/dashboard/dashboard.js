@@ -22,7 +22,7 @@ function row(label, ok, detail) {
  * @param {import("../core/event-bus.js").EventBus} deps.bus
  * @param {ReturnType<typeof import("../core/application-state.js").createApplicationState>} deps.state
  * @param {import("../transports/nostr-transport.js").NostrTransport} deps.transport
- * @param {import("../transports/push-transport.js").TampermonkeyPushTransport} deps.pushTransport
+ * @param {import("../transports/push-transport.js").MiniscordPushTransport} deps.pushTransport
  * @param {() => import("../core/config.js").PublicConfig} deps.getConfig
  * @param {() => boolean} deps.getVapidPrivateKeyPresent
  */
@@ -55,7 +55,7 @@ export function startDashboard({ bus, state, transport, pushTransport, getConfig
       row("Source Feed bridge", sourceFeedBridgeConnected, sourceFeedBridgeConnected ? "connected" : "not detected"),
       row("Google auth", Boolean(config.googleClientId), config.googleClientId ? "configured" : "not configured"),
       row("VAPID", vapidReady, vapidReady ? "configured" : "not configured"),
-      row("Push bridge", pushTransport.isBridgeConnected(), pushTransport.isBridgeConnected() ? "connected" : "not detected"),
+      row("Push relay (miniscord)", pushTransport.isBridgeConnected(), pushTransport.isBridgeConnected() ? "configured" : "not configured"),
     ].join("");
   }
 
