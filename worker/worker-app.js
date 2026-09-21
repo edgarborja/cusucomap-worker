@@ -194,6 +194,13 @@ const QUEST_SCAN_AUTO_DEFAULT_TIME = "04:00";
 // Well under a minute, so the target HH:MM is never skipped between
 // checks, but coarse enough to not matter for a once-a-day trigger.
 const QUEST_SCAN_AUTO_CHECK_INTERVAL_MS = 30_000;
+// How late a catch-up run is allowed to fire past the target time - long
+// enough to cover the worker starting up (or an auto-update reload
+// landing) a few minutes late, short enough that a target the day's
+// window missed entirely (worker down, no rows yet, miniscord not
+// configured) waits for tomorrow instead of firing at some arbitrary
+// later hour once the worker happens to notice.
+const QUEST_SCAN_AUTO_WINDOW_MINUTES = 15;
 
 function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor, scheduledLoopGate, bus, logger }) {
   const id = "quest-scan";
@@ -327,22 +334,32 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
     cancelRequested = true;
   });
 
-  // Fires at most once per calendar day, at or after autoState.time -
-  // "at or after" rather than an exact-minute match, so it still catches
-  // up if the worker was started (or the auto-update reload landed) later
-  // than the target time, and so it isn't lost by a tick that happens to
-  // fall a few seconds late. Silently skips (without marking today as
+  // Fires at most once per calendar day, only within
+  // QUEST_SCAN_AUTO_WINDOW_MINUTES of autoState.time - a bounded catch-up
+  // window (covers the worker starting, or the auto-update reload
+  // landing, a few minutes after the exact target, and the check
+  // interval's own polling granularity), NOT "any time later today it
+  // happens to notice." An earlier version had no upper bound here and
+  // would fire a full batch at whatever time the worker next happened to
+  // load if that day's window had already passed (confirmed live: a
+  // reload at 10pm against a 4am target fired immediately) - once the
+  // window's closed for the day without a run, it waits for tomorrow's
+  // instead. Within the window, silently skips (without marking today as
   // "run") whenever there's nothing to run yet - no rows pasted, or
-  // miniscord not configured - so it's ready to fire the moment either
-  // one becomes true later the same day, rather than only ever on day
-  // boundaries.
+  // miniscord not configured - so it's still ready to fire if either
+  // becomes true before the window closes.
   function checkAutoRun() {
     if (!autoState.enabled || running) return;
     const now = new Date();
     const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     if (autoState.lastRunDate === today) return;
-    const currentHm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-    if (currentHm < autoState.time) return;
+
+    const [targetHour, targetMinute] = autoState.time.split(":").map(Number);
+    const targetMinutesOfDay = targetHour * 60 + targetMinute;
+    const nowMinutesOfDay = now.getHours() * 60 + now.getMinutes();
+    const minutesPastTarget = nowMinutesOfDay - targetMinutesOfDay;
+    if (minutesPastTarget < 0 || minutesPastTarget > QUEST_SCAN_AUTO_WINDOW_MINUTES) return;
+
     if (!miniscordConnector.isConfigured()) return;
 
     const { groups } = parseScanGroupsCsv(textarea.value);
