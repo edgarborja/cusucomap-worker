@@ -97,7 +97,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-20 15:19 UTC</p>
+    <p id="build-date">Build: 2026-09-21 03:27 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -153,7 +153,8 @@
         Runs one <code>/questsearch</code> call per row of a pasted list of scan-group centers (columns: Latitude,
         Longitude, Distance in meters, GroupMemberCount - order doesn't matter), through miniscord, spaced a few
         seconds apart. Covers both encounter and item rewards in a single call per location - no separate raid scan
-        any more, since <code>/gyms</code> already polls every gym in the area continuously.
+        any more, since <code>/gyms</code> already polls every gym in the area continuously. A row that fails is
+        retried up to 5 times before the whole batch stops (see the activity log for which row and why).
       </p>
       <textarea id="quest-scan-csv" rows="6" placeholder="Latitude,Longitude,Distance,GroupMemberCount"></textarea>
       <p>

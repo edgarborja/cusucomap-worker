@@ -113,6 +113,10 @@ function todayKey() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** @returns {string} pubkey hex. Throws if `npub` isn't a valid npub. */
 function decodeNpub(npub) {
   if (!window.NostrTools) throw new Error("NostrTools global not found.");
@@ -163,6 +167,17 @@ const SCAN_CSV_STORAGE_PREFIX = "cusucomap-worker:scan-csv:";
  * resumed in the finally block below, whether the scan finished, failed,
  * or was cancelled.
  */
+// Retried the same way as a subscriber's own single-search scan (see
+// MINISCORD_SCAN_MAX_RETRIES/MINISCORD_SCAN_RETRY_PAUSE_MS inside
+// startWorker) - up to this many additional attempts (so up to this + 1
+// total) per row before giving up. Unlike that scan, exhausting retries
+// here stops the whole batch rather than just skipping the one row: a
+// batch operator watching this run wants to know a location is
+// consistently failing, not have it silently skipped while the rest
+// quietly continues.
+const QUEST_SCAN_MAX_RETRIES = 5;
+const QUEST_SCAN_RETRY_PAUSE_MS = 3000;
+
 function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor, scheduledLoopGate, bus, logger }) {
   const id = "quest-scan";
   const textarea = document.getElementById(`${id}-csv`);
@@ -212,13 +227,32 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
         if (cancelRequested) break;
         statusEl.textContent = `Sending ${sent}/${groups.length}…`;
         const command = buildMiniscordQuestsearchCommand(`${group.lat},${group.lon}`, `${group.radiusKm}km`);
-        const result = await miniscordConnector.searchQuest(command);
-        if (result.ok) {
-          const built = await Promise.all(result.results.map((record) => buildQuestFromMiniscordRecord(record, speciesCache, getGeofilterAnchor())));
-          for (const quest of built.filter(Boolean)) bus.emit("quest.observed", quest);
-        } else {
-          logger.warn("miniscord", `${id}: group ${group.lat},${group.lon} failed: ${result.error}`);
+        const groupLabel = `${group.lat},${group.lon}`;
+
+        let result;
+        for (let attempt = 0; attempt <= QUEST_SCAN_MAX_RETRIES; attempt++) {
+          if (attempt > 0) {
+            logger.warn(
+              "miniscord",
+              `${id}: group ${groupLabel} attempt ${attempt + 1}/${QUEST_SCAN_MAX_RETRIES + 1} - retrying after a failure (${result.error})`
+            );
+            await sleep(QUEST_SCAN_RETRY_PAUSE_MS);
+          }
+          result = await miniscordConnector.searchQuest(command);
+          if (result.ok) break;
         }
+
+        if (!result.ok) {
+          logger.error(
+            "miniscord",
+            `${id}: group ${groupLabel} failed after ${QUEST_SCAN_MAX_RETRIES + 1} attempts (${result.error}) - stopping the batch`
+          );
+          statusEl.textContent = `Stopped after ${sent}/${groups.length} - group ${groupLabel} failed repeatedly.`;
+          return;
+        }
+
+        const built = await Promise.all(result.results.map((record) => buildQuestFromMiniscordRecord(record, speciesCache, getGeofilterAnchor())));
+        for (const quest of built.filter(Boolean)) bus.emit("quest.observed", quest);
         sent++;
       }
       statusEl.textContent = cancelRequested ? `Cancelled after ${sent}/${groups.length}.` : `Done - sent ${sent} group(s).`;
@@ -564,10 +598,6 @@ async function startWorker(publicConfig, secretConfig) {
   // MiniscordConnector's own MIN_GAP_MS, which already paces every call
   // regardless of caller.
   const MINISCORD_SCAN_RETRY_PAUSE_MS = 3000;
-
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
 
   // Reverses authorizeScanRequest's charge - a scan that never got a usable
   // reply after every retry was exhausted shouldn't cost the subscriber
