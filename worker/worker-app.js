@@ -372,6 +372,28 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
   }
   setInterval(checkAutoRun, QUEST_SCAN_AUTO_CHECK_INTERVAL_MS);
   checkAutoRun();
+
+  // Exposed for the commands page's own remote "run now" button (see
+  // getQuestScanStatus/runQuestScanBatch RPC handlers below) - it only
+  // ever reads/triggers this same CSV and runBatch, never edits the CSV
+  // itself, which stays worker-console-only by design.
+  return {
+    getStatus: () => ({ groupCount: parseScanGroupsCsv(textarea.value).groups.length, running }),
+    /** @returns {Promise<{ok:true, groupCount:number} | {ok:false, error:string}>} */
+    async triggerRemoteRun() {
+      if (running) return { ok: false, error: "A quest scan is already running." };
+      const { groups } = parseScanGroupsCsv(textarea.value);
+      if (groups.length === 0) return { ok: false, error: "No rows to scan - paste the group list on the worker page first." };
+      if (!miniscordConnector.isConfigured()) return { ok: false, error: "miniscord isn't configured on the worker." };
+      // Not awaited - same "ack once started, watch the worker's own
+      // activity log for progress" shape as runAreaScan's own RPC handler
+      // below. A batch can run for many minutes; the RPC caller's own
+      // timeout (see shared/rpc-client.js's DEFAULT_TIMEOUT_MS) is far
+      // shorter than that.
+      runBatch(groups, { auto: false });
+      return { ok: true, groupCount: groups.length };
+    },
+  };
 }
 
 /** Re-broadcasts everything currently active on startup - a relay that pruned an entity while the worker was offline (or a newly-added relay with no history at all) still converges to the correct current state. */
@@ -580,19 +602,47 @@ async function startWorker(publicConfig, secretConfig) {
   // which is a separate, general-purpose default for the scheduled loop.
   const WATCH_CHANNEL_SEARCH_RADIUS = "10km";
   const WATCH_CHANNEL_SEARCH_FILTER = "iv100";
+  // Retried the same way as the other miniscord-backed retry loops in this
+  // file (quest-scan, a subscriber's own scan) - up to this many
+  // additional attempts (so up to this + 1 total) before giving up and
+  // handing the failure back to WatchChannelConnector, which logs it.
+  const WATCH_CHANNEL_SEARCH_MAX_RETRIES = 2;
+  const WATCH_CHANNEL_SEARCH_RETRY_PAUSE_MS = 3000;
 
   const watchChannelConnector = new WatchChannelConnector({
     logger,
     getWatchChannelName: () => publicConfig.watchChannelName,
     miniscordConnector,
-    runSpecialSearch: () =>
-      runOrganicMiniscordSearch(
-        buildMiniscordPokesearchCommand(
-          `${publicConfig.geofilterAnchor.lat},${publicConfig.geofilterAnchor.lon}`,
-          WATCH_CHANNEL_SEARCH_RADIUS,
-          WATCH_CHANNEL_SEARCH_FILTER
-        )
-      ),
+    // Pauses the scheduled loop (scheduledLoopGate, "watch-channel"
+    // reason) for the whole retry sequence, not just a single attempt -
+    // "returning to the looped searches" only happens once this search
+    // has either succeeded or exhausted every retry, same as quest-scan's
+    // own pause already does for its batch.
+    runSpecialSearch: async () => {
+      const command = buildMiniscordPokesearchCommand(
+        `${publicConfig.geofilterAnchor.lat},${publicConfig.geofilterAnchor.lon}`,
+        WATCH_CHANNEL_SEARCH_RADIUS,
+        WATCH_CHANNEL_SEARCH_FILTER
+      );
+      scheduledLoopGate.pause("watch-channel");
+      try {
+        let result;
+        for (let attempt = 0; attempt <= WATCH_CHANNEL_SEARCH_MAX_RETRIES; attempt++) {
+          if (attempt > 0) {
+            logger.warn(
+              "miniscord",
+              `watch-channel special search attempt ${attempt + 1}/${WATCH_CHANNEL_SEARCH_MAX_RETRIES + 1} - retrying after a failure (${result.error})`
+            );
+            await sleep(WATCH_CHANNEL_SEARCH_RETRY_PAUSE_MS);
+          }
+          result = await runOrganicMiniscordSearch(command);
+          if (result.ok) break;
+        }
+        return result;
+      } finally {
+        scheduledLoopGate.resume("watch-channel");
+      }
+    },
     lastSeenMessageIdCache: {
       get: () => state.workerMetadata.get("watchChannelLastSeenMessageId", null),
       set: (id) => state.workerMetadata.set("watchChannelLastSeenMessageId", id),
@@ -601,7 +651,14 @@ async function startWorker(publicConfig, secretConfig) {
   notifyWatchChannelActivity = () => watchChannelConnector.notifyMiniscordActivity();
   watchChannelConnector.start();
 
-  wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor: () => publicConfig.geofilterAnchor, scheduledLoopGate, bus, logger });
+  const questScanControls = wireQuestScanSection({
+    miniscordConnector,
+    speciesCache,
+    getGeofilterAnchor: () => publicConfig.geofilterAnchor,
+    scheduledLoopGate,
+    bus,
+    logger,
+  });
 
   // secretConfig.fcmServiceAccountJson is fixed for this session (set once
   // at Start Worker time, like vapidPrivateKey/nsec), so parsing it once
@@ -665,6 +722,19 @@ async function startWorker(publicConfig, secretConfig) {
     if (error) return { ok: false, error };
     await saveScheduledSearches(state, params.scheduledSearches);
     return { ok: true, scheduledSearches: params.scheduledSearches };
+  });
+  // Self-pubkey-only, same reasoning as getScheduledSearches/
+  // setScheduledSearches above. The commands page only ever reads the
+  // group count and triggers a run through these - the CSV itself stays
+  // editable only from the worker's own console (see
+  // wireQuestScanSection's own textarea/localStorage), never over RPC.
+  rpc.handle("getQuestScanStatus", async (_params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    return { ok: true, ...questScanControls.getStatus() };
+  });
+  rpc.handle("runQuestScanBatch", async (_params, { fromPubkey }) => {
+    if (fromPubkey !== transport.identity.hex) return { ok: false, error: "forbidden - caller's pubkey doesn't match this worker's own identity" };
+    return questScanControls.triggerRemoteRun();
   });
   // A subscriber's own dailyLimit (set via setScanSubscriber's admin panel
   // field) overrides the fleet-wide default - absent/null means "use the

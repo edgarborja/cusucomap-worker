@@ -28,7 +28,7 @@ export class WatchChannelConnector {
   /**
    * @param {() => string} getWatchChannelName - channel id/name to pass as GET /unread/{idOrName}'s path segment - leave blank to disable.
    * @param {import("./miniscord-connector.js").MiniscordConnector} miniscordConnector
-   * @param {() => Promise<{ok:boolean, error?:string}>} runSpecialSearch - runs the fixed iv100 pokesearch and publishes whatever it finds.
+   * @param {() => Promise<{ok:boolean, error?:string}>} runSpecialSearch - runs the fixed iv100 pokesearch and publishes whatever it finds; owns its own retry policy internally (see worker-app.js's own implementation) and only resolves once it's given up on retrying, same as this class's own single-attempt-per-check contract expects.
    * @param {{get: () => Promise<string|null>, set: (id: string) => Promise<void>}} lastSeenMessageIdCache - persisted (not just in-memory) so a restart doesn't mistake a message that was already unread before the restart for a brand new one.
    */
   constructor({ logger, getWatchChannelName, miniscordConnector, runSpecialSearch, lastSeenMessageIdCache }) {

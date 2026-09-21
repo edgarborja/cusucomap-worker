@@ -139,6 +139,7 @@ document.getElementById("connect-form").addEventListener("submit", async (event)
     document.getElementById("worker-npub").textContent = NT.nip19.npubEncode(pubkeyHex);
     document.getElementById("worker-npub").hidden = false;
     renderScheduled(commands.scheduledSearches);
+    await refreshQuestScanStatus();
     await refreshScanSubscribers(0);
     document.getElementById("connect-screen").hidden = true;
     document.getElementById("commands-screen").hidden = false;
@@ -206,6 +207,44 @@ document.getElementById("area-scan-form").addEventListener("submit", async (even
     statusEl.textContent = `Started - ${result.total} commands queued. Watch the worker's own activity log for progress.`;
   } catch (err) {
     statusEl.hidden = true;
+    errorEl.textContent = `Failed to start: ${err.message}`;
+    errorEl.hidden = false;
+  }
+});
+
+// The scan-group CSV itself is never editable here - only entered on the
+// worker's own console (see worker-app.js's wireQuestScanSection) - this
+// just reflects its current row count and lets an operator trigger a run
+// remotely without having to be at the worker's own screen.
+async function refreshQuestScanStatus() {
+  const countEl = document.getElementById("quest-scan-remote-count");
+  const errorEl = document.getElementById("quest-scan-remote-error");
+  const runButton = document.getElementById("quest-scan-remote-run");
+  errorEl.hidden = true;
+  try {
+    const result = await callSelf("getQuestScanStatus");
+    const runningNote = result.running ? " - a scan is currently running" : "";
+    countEl.textContent = `${result.groupCount} group(s) in the batch${runningNote}.`;
+    runButton.disabled = result.groupCount === 0 || result.running;
+  } catch (err) {
+    countEl.textContent = "…";
+    errorEl.textContent = `Failed to load: ${err.message}`;
+    errorEl.hidden = false;
+  }
+}
+document.getElementById("quest-scan-remote-refresh").addEventListener("click", () => refreshQuestScanStatus());
+
+document.getElementById("quest-scan-remote-run").addEventListener("click", async () => {
+  const errorEl = document.getElementById("quest-scan-remote-error");
+  const statusEl = document.getElementById("quest-scan-remote-status");
+  errorEl.hidden = true;
+  if (!confirm("Start the quest scan batch on the worker now?")) return;
+  try {
+    const result = await callSelf("runQuestScanBatch");
+    statusEl.textContent = `Started - ${result.groupCount} group(s) queued. Watch the worker's own activity log for progress.`;
+    statusEl.hidden = false;
+    await refreshQuestScanStatus();
+  } catch (err) {
     errorEl.textContent = `Failed to start: ${err.message}`;
     errorEl.hidden = false;
   }

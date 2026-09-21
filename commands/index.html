@@ -86,6 +86,23 @@
     </div>
 
     <div class="panel">
+      <h2>Quest scan <span class="hint">(one-time - runs the batch already pasted on the worker page)</span></h2>
+      <p class="lede">
+        The scan-group list itself is only ever entered on the worker's own console - this just runs whatever's
+        pasted there right now, remotely. Progress shows up in the worker's own activity log, not here.
+      </p>
+      <p>
+        <span id="quest-scan-remote-count" class="hint">…</span>
+        <button id="quest-scan-remote-refresh" type="button">↻ Refresh</button>
+      </p>
+      <p>
+        <button id="quest-scan-remote-run" type="button">Run quest scan</button>
+        <span id="quest-scan-remote-status" hidden></span>
+      </p>
+      <p id="quest-scan-remote-error" class="error" hidden></p>
+    </div>
+
+    <div class="panel">
       <h2>Scan subscribers <span class="hint">("cusucos" - who can request a scan, and until when)</span></h2>
       <p class="lede">
         Only npubs listed here (with a not-yet-expired date) can request an area/species scan of their own. Each
