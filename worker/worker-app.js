@@ -166,6 +166,11 @@ const SCAN_CSV_STORAGE_PREFIX = "cusucomap-worker:scan-csv:";
  * miniscord pacing chain, slowing both down for no benefit. Always
  * resumed in the finally block below, whether the scan finished, failed,
  * or was cancelled.
+ *
+ * Also wires the "Run at scheduled time" auto-run toggle + time picker
+ * (see checkAutoRun below) - the manual button and the auto-trigger both
+ * funnel through the same runBatch() so they behave identically once
+ * started (same pause/retry/stop behavior, same status text).
  */
 // Retried the same way as a subscriber's own single-search scan (see
 // MINISCORD_SCAN_MAX_RETRIES/MINISCORD_SCAN_RETRY_PAUSE_MS inside
@@ -178,12 +183,26 @@ const SCAN_CSV_STORAGE_PREFIX = "cusucomap-worker:scan-csv:";
 const QUEST_SCAN_MAX_RETRIES = 5;
 const QUEST_SCAN_RETRY_PAUSE_MS = 3000;
 
+// Auto-run toggle/time (see index.html's own hint) - persisted separately
+// from the CSV itself since the toggle needs its own "on by default"
+// initial value, unlike the CSV (which has no sensible non-empty
+// default). Picked as an early-morning default time per an earlier
+// conversation about running this kind of sweep before the day starts -
+// change it on the dashboard if that's wrong for your area.
+const QUEST_SCAN_AUTO_STORAGE_KEY = "cusucomap-worker:quest-scan-auto:v1";
+const QUEST_SCAN_AUTO_DEFAULT_TIME = "04:00";
+// Well under a minute, so the target HH:MM is never skipped between
+// checks, but coarse enough to not matter for a once-a-day trigger.
+const QUEST_SCAN_AUTO_CHECK_INTERVAL_MS = 30_000;
+
 function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor, scheduledLoopGate, bus, logger }) {
   const id = "quest-scan";
   const textarea = document.getElementById(`${id}-csv`);
   const startButton = document.getElementById(`${id}-start`);
   const cancelButton = document.getElementById(`${id}-cancel`);
   const statusEl = document.getElementById(`${id}-status`);
+  const autoToggle = document.getElementById(`${id}-auto-toggle`);
+  const autoTime = document.getElementById(`${id}-auto-time`);
   const storageKey = `${SCAN_CSV_STORAGE_PREFIX}${id}`;
 
   try {
@@ -200,21 +219,42 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
     }
   });
 
+  // lastRunDate is persisted too, not just held in memory - a worker
+  // restart (including the automatic one UPDATE_CHECK_INTERVAL_MS can
+  // trigger) must not forget an auto-run that already happened today and
+  // fire a second one.
+  let autoState = { enabled: true, time: QUEST_SCAN_AUTO_DEFAULT_TIME, lastRunDate: null };
+  try {
+    const saved = localStorage.getItem(QUEST_SCAN_AUTO_STORAGE_KEY);
+    if (saved) autoState = { ...autoState, ...JSON.parse(saved) };
+  } catch {
+    // ignore - defaults stand
+  }
+  function saveAutoState() {
+    try {
+      localStorage.setItem(QUEST_SCAN_AUTO_STORAGE_KEY, JSON.stringify(autoState));
+    } catch {
+      // ignore
+    }
+  }
+  autoToggle.checked = autoState.enabled;
+  autoTime.value = autoState.time;
+  autoToggle.addEventListener("change", () => {
+    autoState.enabled = autoToggle.checked;
+    saveAutoState();
+  });
+  autoTime.addEventListener("change", () => {
+    if (!autoTime.value) return;
+    autoState.time = autoTime.value;
+    saveAutoState();
+  });
+
   let cancelRequested = false;
+  let running = false;
 
-  startButton.addEventListener("click", async () => {
-    const { groups, errors } = parseScanGroupsCsv(textarea.value);
-    for (const err of errors) logger.warn("miniscord", `${id}: ${err}`);
-    if (groups.length === 0) {
-      logger.warn("miniscord", `${id}: nothing to scan - paste the group list first.`);
-      return;
-    }
-    if (!miniscordConnector.isConfigured()) {
-      logger.warn("miniscord", `${id}: miniscord isn't configured - set the Miniscord URL first.`);
-      return;
-    }
-    if (!confirm(`Start a quest scan over ${groups.length} groups? Each location is a separate miniscord call, spaced a few seconds apart.`)) return;
-
+  /** @param {{lat: string, lon: string, radiusKm: string}[]} groups @param {{auto: boolean}} opts */
+  async function runBatch(groups, { auto }) {
+    running = true;
     cancelRequested = false;
     startButton.hidden = true;
     cancelButton.hidden = false;
@@ -257,18 +297,64 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
       }
       statusEl.textContent = cancelRequested ? `Cancelled after ${sent}/${groups.length}.` : `Done - sent ${sent} group(s).`;
     } catch (err) {
-      logger.error("miniscord", `${id} failed: ${err.message}`);
+      logger.error("miniscord", `${id}${auto ? " (auto)" : ""} failed: ${err.message}`);
       statusEl.textContent = `Failed: ${err.message}`;
     } finally {
       scheduledLoopGate.resume("quest-scan");
       startButton.hidden = false;
       cancelButton.hidden = true;
+      running = false;
     }
+  }
+
+  startButton.addEventListener("click", async () => {
+    if (running) return;
+    const { groups, errors } = parseScanGroupsCsv(textarea.value);
+    for (const err of errors) logger.warn("miniscord", `${id}: ${err}`);
+    if (groups.length === 0) {
+      logger.warn("miniscord", `${id}: nothing to scan - paste the group list first.`);
+      return;
+    }
+    if (!miniscordConnector.isConfigured()) {
+      logger.warn("miniscord", `${id}: miniscord isn't configured - set the Miniscord URL first.`);
+      return;
+    }
+    if (!confirm(`Start a quest scan over ${groups.length} groups? Each location is a separate miniscord call, spaced a few seconds apart.`)) return;
+    await runBatch(groups, { auto: false });
   });
 
   cancelButton.addEventListener("click", () => {
     cancelRequested = true;
   });
+
+  // Fires at most once per calendar day, at or after autoState.time -
+  // "at or after" rather than an exact-minute match, so it still catches
+  // up if the worker was started (or the auto-update reload landed) later
+  // than the target time, and so it isn't lost by a tick that happens to
+  // fall a few seconds late. Silently skips (without marking today as
+  // "run") whenever there's nothing to run yet - no rows pasted, or
+  // miniscord not configured - so it's ready to fire the moment either
+  // one becomes true later the same day, rather than only ever on day
+  // boundaries.
+  function checkAutoRun() {
+    if (!autoState.enabled || running) return;
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    if (autoState.lastRunDate === today) return;
+    const currentHm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    if (currentHm < autoState.time) return;
+    if (!miniscordConnector.isConfigured()) return;
+
+    const { groups } = parseScanGroupsCsv(textarea.value);
+    if (groups.length === 0) return;
+
+    autoState.lastRunDate = today;
+    saveAutoState();
+    logger.info("miniscord", `${id}: auto-starting the scheduled scan over ${groups.length} group(s) (target time ${autoState.time})`);
+    runBatch(groups, { auto: true });
+  }
+  setInterval(checkAutoRun, QUEST_SCAN_AUTO_CHECK_INTERVAL_MS);
+  checkAutoRun();
 }
 
 /** Re-broadcasts everything currently active on startup - a relay that pruned an entity while the worker was offline (or a newly-added relay with no history at all) still converges to the correct current state. */

@@ -97,7 +97,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-21 03:27 UTC</p>
+    <p id="build-date">Build: 2026-09-21 03:54 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>
@@ -161,6 +161,18 @@
         <button id="quest-scan-start" type="button">Start quest scan</button>
         <button id="quest-scan-cancel" type="button" hidden>Cancel</button>
         <span id="quest-scan-status" hidden></span>
+      </p>
+      <p class="hint">
+        When enabled, the scan starts on its own at the time below (once per day, if there are rows pasted above) -
+        no confirmation prompt, same as a manual start otherwise (pauses the scheduled loop for its own duration,
+        same retry-then-stop behavior on a failing row).
+      </p>
+      <p>
+        <label class="checkbox">
+          <input id="quest-scan-auto-toggle" type="checkbox" />
+          Run at scheduled time
+        </label>
+        <input id="quest-scan-auto-time" type="time" />
       </p>
     </div>
   </section>
