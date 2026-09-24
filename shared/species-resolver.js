@@ -21,9 +21,22 @@ export function normalizeSpeciesKey(raw) {
 
 // PokeAPI has no plain default-form slug for a handful of species - only
 // named-form ones (e.g. no "giratina", only "giratina-altered"/
-// "giratina-origin"), so a fetch using the species name as-is 404s. Add to
-// this map as more otherwise-unresolved species turn up in the activity log.
-const SPECIES_SLUG_OVERRIDES = { giratina: "giratina-altered" };
+// "giratina-origin"), so a fetch using the species name as-is 404s. Used
+// as the default when no form is known at all (e.g. a quest/spawn
+// reward, which never carries a separate form field into resolveSpecies)
+// - a raid boss with a real, known form instead resolves through the
+// form-aware attempt below, which takes priority over this map. The whole
+// Forces of Nature family (confirmed live: "thundurus"/"tornadus"/
+// "landorus"/"enamorus" all 404 bare, only "<name>-incarnate" etc. exist)
+// turned up together via one Thundurus raid - add more here as they turn
+// up in the activity log.
+const SPECIES_SLUG_OVERRIDES = {
+  giratina: "giratina-altered",
+  thundurus: "thundurus-incarnate",
+  tornadus: "tornadus-incarnate",
+  landorus: "landorus-incarnate",
+  enamorus: "enamorus-incarnate",
+};
 
 // Unown is a different case from the override map above: its letter forms
 // aren't separate PokeAPI "pokemon" entries at all (confirmed live -
@@ -56,22 +69,47 @@ const defaultCache = {
   },
 };
 
-/** @returns {Promise<{ spriteUrl: string, types: string[] } | null>} */
-export async function resolveSpecies(speciesRaw, cache = defaultCache) {
+/**
+ * @param {string} speciesRaw
+ * @param {{get, set}} [cache]
+ * @param {string|null} [form] - a caller-known form (today: only
+ *   miniscord-gym.js's bossForm) - tried as "<species>-<form>" before the
+ *   plain species slug, so a species with multiple real forms (Thundurus
+ *   Incarnate vs. Therian, not just Thundurus vs. nothing) gets its own
+ *   correct sprite/types instead of always falling through to whatever
+ *   single default SPECIES_SLUG_OVERRIDES picks below.
+ * @returns {Promise<{ spriteUrl: string, types: string[] } | null>}
+ */
+export async function resolveSpecies(speciesRaw, cache = defaultCache, form = null) {
   const key = normalizeSpeciesKey(speciesRaw);
   if (!key) return null;
 
   const seeded = SPECIES_SEED[key];
   if (seeded) return { spriteUrl: `${SPRITE_BASE}${seeded[0]}.png`, types: seeded[1] };
 
-  const cached = await cache.get(`species:${key}`);
+  const unownLetter = key.match(UNOWN_FORM_RE)?.[1];
+  const formKey = form && !unownLetter ? normalizeSpeciesKey(form) : null;
+  const cacheKey = formKey ? `species:${key}:${formKey}` : `species:${key}`;
+  const cached = await cache.get(cacheKey);
   if (cached !== null && cached !== undefined) return cached;
 
-  const unownLetter = key.match(UNOWN_FORM_RE)?.[1];
+  if (formKey) {
+    try {
+      const result = await fetchSpeciesBySlug(`${key}-${formKey}`, null);
+      await cache.set(cacheKey, result);
+      return result;
+    } catch {
+      // Not every species/form combination is real PokeAPI slug shape
+      // (e.g. a raid boss whose bossForm is "Mega", already a full
+      // species name of its own, not a suffix) - fall through to the
+      // plain-species attempt below rather than giving up here.
+    }
+  }
+
   const slug = SPECIES_SLUG_OVERRIDES[key] || (unownLetter ? "unown" : key);
   try {
     const result = await fetchSpeciesBySlug(slug, unownLetter);
-    await cache.set(`species:${key}`, result);
+    await cache.set(cacheKey, result);
     return result;
   } catch (err) {
     console.warn(`[species-resolver] could not resolve "${speciesRaw}" (slug "${slug}"):`, err.message);
@@ -101,7 +139,7 @@ export async function resolveSpecies(speciesRaw, cache = defaultCache) {
       });
   if (fallback) {
     console.warn(`[species-resolver] resolved "${speciesRaw}" via base species fallback "${baseKey}"`);
-    await cache.set(`species:${key}`, fallback);
+    await cache.set(cacheKey, fallback);
   }
   return fallback;
 }

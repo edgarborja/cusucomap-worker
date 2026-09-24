@@ -90,7 +90,7 @@ export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = ne
   const { lat, lon } = gym.location;
   const locationKey = gymLocationKey(lat, lon);
   const id = stableIntId(`gym|${locationKey}`);
-  const sprite = await resolveSpecies(bossSpecies, speciesCache);
+  const sprite = await resolveSpecies(bossSpecies, speciesCache, bossForm);
   const gymName = gym.name || gymNameByLocation.get(locationKey) || `Gym near ${lat.toFixed(4)},${lon.toFixed(4)}`;
 
   return {
