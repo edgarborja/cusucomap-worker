@@ -18,7 +18,7 @@ const STORE_DEFS = {
   // device identity doesn't, so a new KIND_DEVICE_NOTIFY_CONFIG event from
   // the same device replaces its one row instead of leaving an orphaned
   // row under the old endpoint. See shared/notifications.md section 4.
-  pushSubscriptions: { keyPath: "nostrPubkey", indexes: [["byUser", "userId", { unique: false }], ["byEndpoint", "endpoint", { unique: false }]] },
+  pushSubscriptions: { keyPath: "nostrPubkey" },
   // Dedup guard for inbound Nostr RPC requests (replay protection) - see
   // worker/transports/rpc.js. Pruned on a timer, not kept forever.
   processedEvents: { keyPath: "eventId" },
@@ -124,21 +124,12 @@ export class Collection {
     return reqToPromise((await this.#store("readonly")).getAll());
   }
 
-  async getAllByIndex(indexName, value) {
-    const store = await this.#store("readonly");
-    return reqToPromise(store.index(indexName).getAll(value));
-  }
-
   async put(value) {
     return reqToPromise((await this.#store("readwrite")).put(value));
   }
 
   async delete(key) {
     return reqToPromise((await this.#store("readwrite")).delete(key));
-  }
-
-  async count() {
-    return reqToPromise((await this.#store("readonly")).count());
   }
 }
 

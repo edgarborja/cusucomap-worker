@@ -30,8 +30,10 @@ export function isValidDexNumber(value) {
 
 /**
  * @param {number} dexNumber - already validated via isValidDexNumber.
- * @param {{ lat: number, lon: number, radiusKmText: string }} center - see
- *   config.js's defaultSearchCenterLat/Lon/RadiusKmText.
+ * @param {{ lat: number, lon: number, radiusKmText: string }} center - the
+ *   self-scan default is config.js's own PublicConfig.mapCenter/
+ *   searchRadiusKmText; a subscriber-requested scan instead uses their
+ *   own requested center with config.js's fixed subscriberScanRadiusKmText.
  */
 export function buildSpeciesScanCommand(dexNumber, { lat, lon, radiusKmText }) {
   return buildMiniscordPokesearchCommand(dexNumber, `${lat.toFixed(6)},${lon.toFixed(6)}`, `${radiusKmText}km`);

@@ -3,19 +3,26 @@
 // content section) - the miniscord equivalent of miniscord-spawn.js's own
 // role for pokesearch spawns and miniscord-gym.js's for /gyms raids.
 //
-// Mirrors source-feed-connector.js's own #emitQuest almost exactly - same
-// resolvePoi/MEGA_ENERGY_RE/species-vs-item-sprite logic - since
-// questsearch's response already hands over the same clean, pre-split
-// fields (rewardType/rewardName/rewardForm/rewardQuantity) the DOM parser
-// used to have to derive itself via parseReward. Unlike miniscord-gym.js,
-// there's no placeholder-name fallback here: a quest's pokestopName is a
-// real name straight from the reply text, so resolvePoi either finds a
-// real match or this quest is skipped, same as the DOM-scraped path
-// already does for an unrecognized pokestop.
-import { resolvePoi } from "../../shared/poi-resolver.js";
+// Identity is derived directly from the reported pokestop's own
+// coordinates (same reasoning as miniscord-gym.js's gymLocationKey), not
+// from a lookup against a pre-scraped POI database: questsearch already
+// hands over both a real name *and* real coordinates for every result
+// (`location`, parsed from the reply's own Maps link, is documented as
+// "always present"), so there's nothing a database match would add except
+// a dependency on that database actually containing this exact pokestop
+// already - which silently dropped every quest at a not-yet-catalogued
+// pokestop under the old design. poiId is always null here, matching the
+// wire type's existing "no known POI match" allowance (already the norm
+// for /gyms-sourced raids).
 import { resolveSpecies, resolveItemSprite } from "../../shared/species-resolver.js";
+import { stableIntId } from "../../shared/stable-id.js";
 
 const MEGA_ENERGY_RE = /^Mega Energy \(([^)]+)\)$/i;
+
+/** Same join-key shape as miniscord-gym.js's gymLocationKey - keeps re-polling the same pokestop mapped to the same entity row instead of a new one each time. */
+export function questLocationKey(lat, lon) {
+  return `${lat.toFixed(6)}|${lon.toFixed(6)}`;
+}
 
 /**
  * @param {object} record - one element of miniscord's POST /questsearch
@@ -23,16 +30,13 @@ const MEGA_ENERGY_RE = /^Mega Energy \(([^)]+)\)$/i;
  *   field list).
  * @param {{get, set}} speciesCache - see shared/species-resolver.js's own
  *   resolveSpecies for the shape.
- * @param {{lat: number, lon: number}} geofilterAnchor - disambiguation
- *   center for a pokestop name resolvePoi finds more than one candidate
- *   for with no closer exact-location tiebreaker (record.location already
- *   covers the usual case; this is only the tiebreaker of last resort).
- * @returns {Promise<object|null>} a complete wire-protocol Quest, or null
- *   if `record.pokestopName` doesn't match any known POI.
+ * @returns {Promise<object>} a complete wire-protocol Quest - always
+ *   succeeds; there's no lookup left here that can fail the way a POI
+ *   match used to.
  */
-export async function buildQuestFromMiniscordRecord(record, speciesCache, geofilterAnchor) {
-  const poi = resolvePoi(record.pokestopName, "S", record.location, geofilterAnchor);
-  if (!poi) return null;
+export async function buildQuestFromMiniscordRecord(record, speciesCache) {
+  const { lat, lon } = record.location;
+  const id = stableIntId(`quest|${questLocationKey(lat, lon)}`);
 
   const megaMatch = record.rewardType === "item" ? record.rewardName.match(MEGA_ENERGY_RE) : null;
   const speciesToResolve = record.rewardType === "encounter" ? record.rewardName : megaMatch ? megaMatch[1] : null;
@@ -40,12 +44,12 @@ export async function buildQuestFromMiniscordRecord(record, speciesCache, geofil
   const itemSpriteUrl = record.rewardType === "item" && !megaMatch ? await resolveItemSprite(record.rewardName, speciesCache) : null;
 
   return {
-    id: poi.id,
+    id,
     channelId: 0,
     messageId: record.messageId,
-    poiId: poi.id,
+    poiId: null,
     pokestopName: record.pokestopName,
-    location: { lat: poi.lat, lon: poi.lon },
+    location: { lat, lon },
     poiPhotoUrl: null,
     rewardType: record.rewardType,
     rewardName: record.rewardName,

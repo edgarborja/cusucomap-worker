@@ -90,10 +90,6 @@ export function buildEntityEventTemplate(kind, id, expiresAtIso, entity, created
   };
 }
 
-export function dTag(event) {
-  return event.tags.find((tag) => tag[0] === "d")?.[1] ?? null;
-}
-
 /**
  * Builds the addressable, plaintext KIND_WORKER_CONFIG event template - the
  * worker's own public config (currently just the VAPID public key) that a

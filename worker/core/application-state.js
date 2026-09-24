@@ -45,10 +45,11 @@ class EntityStore {
    * Inserts or replaces an entity by id, and emits exactly one event
    * describing what happened - "created" (new id), "updated" (existing id,
    * content actually differs), or nothing at all (byte-identical resend,
-   * e.g. the same Source Feed message rescanned). Callers (pokemon-state.js)
-   * decide what "differs" means before calling this, since a despawn timer
-   * ticking down one message-scrape to the next isn't a meaningful change;
-   * this method itself only does the identical-JSON short circuit.
+   * e.g. the same pokestop turning up again in a later scan pass). Callers
+   * (pokemon-state.js) decide what "differs" means before calling this,
+   * since a despawn timer ticking down between two otherwise-identical
+   * observations isn't a meaningful change; this method itself only does
+   * the identical-JSON short circuit.
    * @returns {"created"|"updated"|"unchanged"}
    */
   async upsert(entity) {
@@ -143,9 +144,6 @@ class PushSubscriptionStore {
   async all() {
     return this.#collection.getAll();
   }
-  async byUser(userId) {
-    return this.#collection.getAllByIndex("byUser", userId);
-  }
 }
 
 /**
@@ -184,9 +182,6 @@ class ScanSubscriberStore {
  */
 class PendingScanPoolStore {
   #collection;
-  // Serializes appendSpawn calls - see that method's own comment for why
-  // this exists. Not per-scanId - a single shared chain across every pool.
-  #appendChain = Promise.resolve();
   constructor(collection) {
     this.#collection = collection;
   }
@@ -201,57 +196,6 @@ class PendingScanPoolStore {
   }
   async all() {
     return this.#collection.getAll();
-  }
-  /**
-   * Read-modify-write: appends one spawn to a still-collecting pool. No-op
-   * if the pool doesn't exist (e.g. it was somehow discarded mid-scan), and
-   * a no-op (not a duplicate entry) if this exact spawn (same deterministic
-   * id) is already in the pool - an area scan's deliberately-overlapping
-   * circles can both turn up the same real spawn, and a species scan's
-   * extended queries (min-IV/level/time bands, no maximums) overlap even
-   * more heavily by design, so the same real Pokémon routinely gets
-   * observed more than once in a single scan.
-   *
-   * MUST be serialized, not called as independent get-then-put pairs: a
-   * single multi-pokemon message calls this once per record, all at once,
-   * via source-feed-connector.js's own `Promise.all(pokesearchResults.map(
-   * (spawn, i) => this.#emitSpawn(...)))` - so two or more calls for the
-   * same scanId routinely overlap in practice, not just in theory. Without
-   * this chain, each overlapping call reads the same stale `pool.spawns`
-   * snapshot and writes back its own single addition, and the last one to
-   * finish silently clobbers every other one's write - confirmed as a real
-   * cause of under-counted scan results (most records from any message
-   * with 2+ pokemon in it were being lost this way).
-   */
-  appendSpawn(scanId, spawn) {
-    this.#appendChain = this.#appendChain.then(async () => {
-      const pool = await this.#collection.get(scanId);
-      if (!pool) return;
-      if (pool.spawns.some((s) => s.id === spawn.id)) return;
-      await this.#collection.put({ ...pool, spawns: [...pool.spawns, spawn] });
-    });
-    return this.#appendChain;
-  }
-
-  /**
-   * Marks a still-"collecting" pool "pending" (ready for review) once its
-   * scan has finished sending commands - see worker-app.js's runAreaScan/
-   * finishPool. MUST go through the same #appendChain as appendSpawn, not
-   * its own independent get-then-put: a late-arriving reply's appendSpawn
-   * call can still be queued (in flight) at the exact moment this runs, and
-   * an unserialized write here could land in either order relative to it -
-   * if the append's own read happened before this write landed, its write
-   * back would silently revert the status to "collecting" again, and the
-   * pool would then never visibly finish. Chaining this here guarantees
-   * every append already queued lands first, and none queued after this
-   * call can undo it.
-   */
-  markCollectingAsPending(scanId) {
-    this.#appendChain = this.#appendChain.then(async () => {
-      const pool = await this.#collection.get(scanId);
-      if (pool && pool.status === "collecting") await this.#collection.put({ ...pool, status: "pending" });
-    });
-    return this.#appendChain;
   }
 }
 

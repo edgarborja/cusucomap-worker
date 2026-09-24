@@ -6,9 +6,9 @@
 <!--
   The ApplicationWorker page - see worker/README.md for what this is and
   how it fits with the rest of the repo. This tab, once started, is the
-  authoritative CusucoMap backend: it ingests Source Feed data and miniscord
-  search results, maintains current spawn/raid/research state, and
-  publishes to Nostr for viewers.
+  authoritative CusucoMap backend: it ingests miniscord search results,
+  maintains current spawn/raid/research state, and publishes to Nostr for
+  viewers.
   It is NOT a browser ServiceWorker (see core/logging.js and README for the
   naming distinction the architecture explicitly calls for).
 
@@ -39,8 +39,12 @@
           <textarea id="field-relays" rows="3" placeholder="wss://relay.snort.social"></textarea>
         </label>
 
-        <label>Tracked Source Feed channel ids (one per line)
-          <textarea id="field-source-feed-channels" rows="3" placeholder="123456789012345678"></textarea>
+        <label>Map center (lat,lon) <span class="hint">(the single point every default-area search - the scheduled loop, species scan, the watch-channel's special search - is centered on; also this community's map center in cusucomap-viewer)</span>
+          <input id="field-map-center" type="text" placeholder="13.675873,-89.281163" />
+        </label>
+
+        <label>Default search radius (km) <span class="hint">(how wide an area those same searches cover around the map center above)</span>
+          <input id="field-search-radius-km" type="text" placeholder="10" />
         </label>
 
         <label>Watch channel <span class="hint">(channel id or name checked via miniscord's GET /unread - a genuinely new message there triggers a fixed iv100 pokesearch; leave blank to disable)</span>
@@ -97,7 +101,7 @@
          point. Deliberately not spelled out verbatim in this comment - it
          would otherwise get substituted too, since deploy.sh's sed isn't
          scoped to just the one line that's meant to change. -->
-    <p id="build-date">Build: 2026-09-21 17:56 UTC</p>
+    <p id="build-date">Build: 2026-09-24 16:16 UTC</p>
   </section>
 
   <section id="dashboard-screen" hidden>

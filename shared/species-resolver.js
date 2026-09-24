@@ -46,7 +46,7 @@ async function fetchSpeciesBySlug(slug, unownLetter) {
 }
 
 const memoryCache = new Map();
-/** No-op-persistent default cache; pass a `{get,set}` backed by ApplicationState.workerMetadata for real persistence (see worker/connectors/source-feed-connector.js). */
+/** No-op-persistent default cache; pass a `{get,set}` backed by ApplicationState.workerMetadata for real persistence (see worker/worker-app.js's own speciesCache). */
 const defaultCache = {
   async get(key) {
     return memoryCache.get(key) ?? null;

@@ -1,14 +1,6 @@
 // Converts one raw record from miniscord's POST /pokesearch response into
 // a complete wire-protocol Spawn (see PROTOCOL.md's Spawn content
-// section) - the miniscord equivalent of source-feed-connector.js's own
-// #emitSpawn normalization step for the DOM-scraped path.
-//
-// Kept separate from shared/source-feed-pokemon-search-parser.js's
-// DOM-scraped path rather than unified with it: the two raw shapes differ
-// enough (form vs. combined species text, unix-seconds despawnAt vs.
-// relative despawnInMinutes, moves:null vs. move1/move2) that a shared
-// function would need as much branching as two separate ones, and this
-// way neither path risks the other's regressions.
+// section).
 import { resolveSpecies, FALLBACK_SPRITE_URL } from "../../shared/species-resolver.js";
 import { stableIntId, stableSpawnKey, ivTier } from "../../shared/stable-id.js";
 

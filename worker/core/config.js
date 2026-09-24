@@ -19,12 +19,12 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
 /**
  * @typedef {object} PublicConfig
  * @property {string[]} relays
- * @property {string[]} trackedChannelIds - Source Feed channel ids the bridge should scrape; pushed to the bridge over GM storage so one script install can watch any number of channels (see worker/connectors/source-feed-connector.js's #pushTrackedChannels).
  * @property {string} googleClientId - OAuth client id (Google's own docs: this is not secret, it's the audience).
  * @property {string} vapidPublicKey
  * @property {string} vapidContact - "mailto:you@example.com", required by the Web Push VAPID spec.
  * @property {boolean} rememberSecrets
- * @property {{lat:number, lon:number}} geofilterAnchor - disambiguation center for a quest/raid name shared by two POIs with no exact coordinates on hand.
+ * @property {{lat:number, lon:number}} mapCenter - the single point every miniscord-submitted search with no location of its own (scheduled loop, species scan, the watch-channel's special search) is centered on, matching whatever this community's own map is centered on in cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER. Set on the setup screen - this is the one thing that actually has to change to point this worker at a different community's area.
+ * @property {string} searchRadiusKmText - the radius (km, as a string - embedded verbatim into generated command text) those same searches use around mapCenter. Also set on the setup screen, for the same reason - a bigger or smaller community area needs a different default coverage radius.
  * @property {string} watchChannelName - channel id or name whose unread state (via miniscord's own GET /unread/{idOrName}) signals a hundo may have posted elsewhere (see worker/connectors/watch-channel-connector.js) - leave blank to disable.
  * @property {string} miniscordUrl - base URL of a running miniscord instance (e.g. "http://127.0.0.1:8770"), used for a subscriber's own "cusuco" area/species scan (see worker/connectors/miniscord-connector.js) - a direct REST call to miniscord's own POST /pokesearch, not a browser/AHK/Tampermonkey round trip. Empty means "not configured" - subscriber scans are rejected until this is set.
  */
@@ -33,17 +33,18 @@ const SECRET_KEY = "cusucomap-worker:secret-config:v1"; // only ever written if 
 export function defaultPublicConfig() {
   return {
     relays: [],
-    trackedChannelIds: [],
     googleClientId: "",
     vapidPublicKey: "",
     vapidContact: "mailto:example@example.com",
     rememberSecrets: false,
     watchChannelName: "",
     miniscordUrl: "",
-    // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER - the
-    // tracked channel's own /geofilter setting at the time this default was
-    // captured.
-    geofilterAnchor: { lat: 13.675873, lon: -89.281163 },
+    // Matches cusucomap-viewer's src/nostr-config.ts's DEFAULT_CENTER at the
+    // time this default was captured - change both together if you're
+    // pointing this worker at a different community's area (see this
+    // field's own @property comment above).
+    mapCenter: { lat: 13.675873, lon: -89.281163 },
+    searchRadiusKmText: "10",
   };
 }
 
@@ -62,9 +63,9 @@ export function defaultPublicConfig() {
 export function defaultSearchConfig() {
   return {
     // Each entry is a filter (no location of its own) - run through
-    // miniscord with defaultSearchCenterLat/Lon/RadiusKmText below appended,
-    // one at a time, resting batchRestMinMin/MaxMin between full passes.
-    // Storage/editing goes through core/scheduled-searches.js (see
+    // miniscord with PublicConfig's own mapCenter/searchRadiusKmText
+    // appended, one at a time, resting batchRestMinMin/MaxMin between full
+    // passes. Storage/editing goes through core/scheduled-searches.js (see
     // commands/commands-app.js) - this is just the fallback a worker that's
     // never had a list explicitly set yet falls back to, and what the seed
     // script publishes on first run.
@@ -96,20 +97,11 @@ export function defaultSearchConfig() {
     // buildSubscriberAreaScanCommand). A string, not a number: embedded
     // verbatim into the generated command text. Has no effect on the
     // operator's own (self-pubkey) scans, which still use the full
-    // hex-lattice/rings design with their own radius as today.
+    // hex-lattice/rings design with their own radius as today. Deliberately
+    // much smaller than, and unrelated to, PublicConfig's own
+    // searchRadiusKmText - that one sets how wide a *default* sweep covers,
+    // this one is how close a single subscriber-requested point search gets.
     subscriberScanRadiusKmText: "0.1",
-    // Fixed center/radius used wherever a pokesearch command submitted
-    // through miniscord needs an explicit area but has no location of its
-    // own to search around: every species scan (see species-scan.js's
-    // buildSpeciesScanCommand, self and subscriber alike) and every
-    // scheduled/priority-scan filter search (see worker-app.js) -
-    // miniscord's own channel carries no ambient geofilter, unlike the
-    // operator's tab, so without this those searches would cover the whole
-    // world instead of just this map. Matches the tracked channel's own
-    // former default /pokeset geofilter setting.
-    defaultSearchCenterLat: 13.67744,
-    defaultSearchCenterLon: -89.283353,
-    defaultSearchRadiusKmText: "10",
   };
 }
 

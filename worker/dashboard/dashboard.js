@@ -1,8 +1,8 @@
 // Renders into the static DOM already in index.html's #dashboard-screen -
 // this file only updates cells/rows on an interval and in response to bus
 // events, it doesn't own page navigation or the setup form (see
-// worker-app.js for that). All untrusted text (species/city/etc, ultimately
-// from Source Feed) goes through escapeHtml before landing in innerHTML.
+// worker-app.js for that). All untrusted text (species/city/etc) goes
+// through escapeHtml before landing in innerHTML.
 import { escapeHtml } from "../../shared/schemas.js";
 
 const MAX_LOG_ROWS = 200;
@@ -35,11 +35,6 @@ export function startDashboard({ bus, state, transport, pushTransport, getConfig
   npubEl.textContent = transport.identity.npub;
   npubEl.hidden = false;
 
-  let sourceFeedBridgeConnected = false;
-  bus.on("source-feed.bridge-status", (status) => {
-    sourceFeedBridgeConnected = Boolean(status?.connected);
-  });
-
   function renderHealth() {
     const config = getConfig();
     const relayStatus = transport.relayStatus();
@@ -52,7 +47,6 @@ export function startDashboard({ bus, state, transport, pushTransport, getConfig
     healthTable.innerHTML = [
       row("Worker identity", true, `${transport.identity.npub.slice(0, 24)}…`),
       row("Nostr relays", relaysOk, relaysDetail),
-      row("Source Feed bridge", sourceFeedBridgeConnected, sourceFeedBridgeConnected ? "connected" : "not detected"),
       row("Google auth", Boolean(config.googleClientId), config.googleClientId ? "configured" : "not configured"),
       row("VAPID", vapidReady, vapidReady ? "configured" : "not configured"),
       row("Push relay (miniscord)", pushTransport.isBridgeConnected(), pushTransport.isBridgeConnected() ? "configured" : "not configured"),

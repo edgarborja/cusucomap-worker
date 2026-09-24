@@ -3,22 +3,17 @@
 // the miniscord/Niantic equivalent of miniscord-spawn.js's own role for
 // pokesearch spawns.
 //
-// Unlike the DOM-scraped raid path (source-feed-connector.js's #emitRaid,
-// still used for the organic Discord-posted raid format), this source
-// normally has no gym name at all - Niantic's own API exposes exact
-// coordinates only, unless miniscord has been told (once, permanently -
-// see worker-app.js's runMiniscordGymPoll) to also request it. Rather than
-// reverse-geocoding against the bundled POI list (a real gym could easily
-// be missing from that list, or ambiguous by nearest-distance in a way a
-// name match never needed to worry about), this derives a stable id
-// directly from the gym's own fixed coordinates and falls back to a
-// plain, honest placeholder name only when no real name is known yet -
-// poiId is left null, matching the wire type's own allowance for "no
-// known POI match". Because the id is keyed on location, not on any
+// Niantic's own API exposes exact coordinates only, no gym name, unless
+// miniscord has been told (once, permanently - see worker-app.js's
+// runMiniscordGymPoll) to also request it. Identity is derived directly
+// from the gym's own fixed coordinates (see gymLocationKey below), with a
+// plain, honest placeholder name used whenever no real name is known yet
+// - poiId is always null, since there's no POI database to match against
+// at all any more (see miniscord-quest.js's own comment for why quests
+// work the same way now). Because the id is keyed on location, not on any
 // particular raid, re-polling the same gym with a *different* boss than
 // last time updates the same entity row rather than creating a new one -
-// matching how a gym can only ever host one raid at a time, same as the
-// DOM-scraped path's own POI-keyed id already works.
+// matching how a gym can only ever host one raid at a time.
 import { resolveSpecies, resolveSpeciesNameByDexNumber } from "../../shared/species-resolver.js";
 import { stableIntId } from "../../shared/stable-id.js";
 
@@ -97,10 +92,8 @@ export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = ne
     scrapedAt: new Date().toISOString(),
     status: "active",
     // Never fall back to gym.raid.bossImageUrl (Niantic's own asset) -
-    // matches source-feed-connector.js's own #emitRaid, which has never
-    // used anything but a resolved PokeAPI sprite (or null) for a Raid's
-    // spriteUrl, keeping every raid's art visually consistent regardless
-    // of which path it came in through.
+    // always a resolved PokeAPI sprite, or null, keeping every raid's art
+    // visually consistent.
     spriteUrl: sprite ? sprite.spriteUrl : null,
     types: sprite ? sprite.types : [],
   };

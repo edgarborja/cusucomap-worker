@@ -155,15 +155,13 @@ export class PokemonStateService {
       await this.#state.workerMetadata.increment("validationErrors");
       return;
     }
-    // The Source Feed bridge's initial full-channel scanExistingMessages() (and
-    // its periodic rescan) can resurface a message whose own despawn/ends/
-    // expires time - computed relative to when it was originally posted -
-    // has already passed by the time it reaches the worker now, e.g. a
-    // backlog /pokesearch reply saying "(in 5 minutes)" from an hour ago.
-    // Storing that as "active" just to have the next sweepExpired() (or,
-    // worse, a relay's own NIP-40 expiration check rejecting the publish
-    // with "invalid: event expired") immediately discard it again serves
-    // nobody - skip it here instead, before it ever becomes state.
+    // A connector can hand over an entity whose own despawn/ends/expires
+    // time has already passed by the time it reaches the worker (a slow
+    // reply, a backlog rescan, clock drift). Storing that as "active" just
+    // to have the next sweepExpired() (or, worse, a relay's own NIP-40
+    // expiration check rejecting the publish with "invalid: event
+    // expired") immediately discard it again serves nobody - skip it here
+    // instead, before it ever becomes state.
     if (new Date(entity[expiryField]).getTime() <= Date.now()) {
       this.#logger.info("pokemon-state", `skipped already-expired ${label} (${expiryField} ${entity[expiryField]}): ${entity.species ?? entity.rewardName ?? entity.bossSpecies ?? "?"}`);
       return;

@@ -10,7 +10,6 @@ import { loadPublicConfig, savePublicConfig, loadSecretConfig, saveSecretConfig,
 import { NostrTransport } from "./transports/nostr-transport.js";
 import { Rpc } from "./transports/rpc.js";
 import { MiniscordPushTransport } from "./transports/push-transport.js";
-import { SourceFeedConnector } from "./connectors/source-feed-connector.js";
 import { MiniscordConnector } from "./connectors/miniscord-connector.js";
 import { WatchChannelConnector } from "./connectors/watch-channel-connector.js";
 import { buildSpawnFromMiniscordRecord } from "./core/miniscord-spawn.js";
@@ -202,7 +201,7 @@ const QUEST_SCAN_AUTO_CHECK_INTERVAL_MS = 30_000;
 // later hour once the worker happens to notice.
 const QUEST_SCAN_AUTO_WINDOW_MINUTES = 15;
 
-function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAnchor, scheduledLoopGate, bus, logger }) {
+function wireQuestScanSection({ miniscordConnector, speciesCache, scheduledLoopGate, bus, logger }) {
   const id = "quest-scan";
   const textarea = document.getElementById(`${id}-csv`);
   const startButton = document.getElementById(`${id}-start`);
@@ -298,7 +297,7 @@ function wireQuestScanSection({ miniscordConnector, speciesCache, getGeofilterAn
           return;
         }
 
-        const built = await Promise.all(result.results.map((record) => buildQuestFromMiniscordRecord(record, speciesCache, getGeofilterAnchor())));
+        const built = await Promise.all(result.results.map((record) => buildQuestFromMiniscordRecord(record, speciesCache)));
         for (const quest of built.filter(Boolean)) bus.emit("quest.observed", quest);
         sent++;
       }
@@ -432,15 +431,6 @@ async function startWorker(publicConfig, secretConfig) {
   const pokemonState = new PokemonStateService({ state, bus, logger });
   pokemonState.start();
 
-  const sourceFeedConnector = new SourceFeedConnector({
-    bus,
-    logger,
-    state,
-    getGeofilterAnchor: () => publicConfig.geofilterAnchor,
-    getTrackedChannelIds: () => publicConfig.trackedChannelIds,
-  });
-  sourceFeedConnector.start();
-
   // Replaces AHK/the browser/Tampermonkey for every pokesearch/questsearch
   // command - scheduled searches, the watch-channel's special search, both
   // the operator's own (self) and a subscriber's area/species scan, and
@@ -450,9 +440,8 @@ async function startWorker(publicConfig, secretConfig) {
   // dedicated-second-tab design this superseded. AHK itself has been fully
   // retired.
   const miniscordConnector = new MiniscordConnector({ getBaseUrl: () => publicConfig.miniscordUrl, logger });
-  // Same cache backing (and key prefix) as source-feed-connector.js's own
-  // speciesCache - shares resolved PokeAPI lookups across both paths
-  // rather than each maintaining an independent copy.
+  // Backed by workerMetadata so resolved PokeAPI lookups (species sprites/
+  // types) survive a reload instead of re-fetching from scratch.
   const speciesCache = {
     get: (key) => state.workerMetadata.get(`speciesResolverCache:${key}`, null),
     set: (key, value) => state.workerMetadata.set(`speciesResolverCache:${key}`, value),
@@ -529,15 +518,14 @@ async function startWorker(publicConfig, secretConfig) {
   async function runMiniscordScheduledBatch(generation) {
     if (miniscordConnector.isConfigured()) {
       const scheduledSearches = await loadScheduledSearches(state, defaultSearchConfig().scheduledSearches);
-      const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultSearchConfig();
       for (const entry of scheduledSearches) {
         if (generation !== scheduledLoopGeneration) return;
         await scheduledLoopGate.waitIfPaused();
         if (generation !== scheduledLoopGeneration) return; // re-check - could have been stopped while waiting
         const command = buildMiniscordPokesearchCommand(
           stripPokesearchPrefix(entry),
-          `${defaultSearchCenterLat.toFixed(6)},${defaultSearchCenterLon.toFixed(6)}`,
-          `${defaultSearchRadiusKmText}km`
+          `${publicConfig.mapCenter.lat.toFixed(6)},${publicConfig.mapCenter.lon.toFixed(6)}`,
+          `${publicConfig.searchRadiusKmText}km`
         );
         const result = await runOrganicMiniscordSearch(command);
         if (!result.ok) logger.warn("miniscord", `scheduled search "${entry}" failed: ${result.error}`);
@@ -595,12 +583,10 @@ async function startWorker(publicConfig, secretConfig) {
   }
   runMiniscordGymPoll();
 
-  // Fixed center/radius/filter for the watch channel's own special
-  // pokesearch (see WatchChannelConnector) - the lat/lon deliberately
-  // reuses the tracked channel's own geofilterAnchor (the same point the
-  // real /geofilter command was set to), not defaultSearchCenterLat/Lon,
-  // which is a separate, general-purpose default for the scheduled loop.
-  const WATCH_CHANNEL_SEARCH_RADIUS = "10km";
+  // Fixed filter for the watch channel's own special pokesearch (see
+  // WatchChannelConnector) - center/radius come from PublicConfig's own
+  // mapCenter/searchRadiusKmText, same as everything else that needs a
+  // default area to search.
   const WATCH_CHANNEL_SEARCH_FILTER = "iv100";
   // Retried the same way as the other miniscord-backed retry loops in this
   // file (quest-scan, a subscriber's own scan) - up to this many
@@ -620,8 +606,8 @@ async function startWorker(publicConfig, secretConfig) {
     // own pause already does for its batch.
     runSpecialSearch: async () => {
       const command = buildMiniscordPokesearchCommand(
-        `${publicConfig.geofilterAnchor.lat},${publicConfig.geofilterAnchor.lon}`,
-        WATCH_CHANNEL_SEARCH_RADIUS,
+        `${publicConfig.mapCenter.lat},${publicConfig.mapCenter.lon}`,
+        `${publicConfig.searchRadiusKmText}km`,
         WATCH_CHANNEL_SEARCH_FILTER
       );
       scheduledLoopGate.pause("watch-channel");
@@ -654,7 +640,6 @@ async function startWorker(publicConfig, secretConfig) {
   const questScanControls = wireQuestScanSection({
     miniscordConnector,
     speciesCache,
-    getGeofilterAnchor: () => publicConfig.geofilterAnchor,
     scheduledLoopGate,
     bus,
     logger,
@@ -981,11 +966,10 @@ async function startWorker(publicConfig, secretConfig) {
     const auth = await authorizeScanRequest(fromPubkey, "runSpeciesScan");
     if (!auth.ok) return auth;
 
-    const { defaultSearchCenterLat, defaultSearchCenterLon, defaultSearchRadiusKmText } = defaultSearchConfig();
     const command = buildSpeciesScanCommand(dexNumber, {
-      lat: defaultSearchCenterLat,
-      lon: defaultSearchCenterLon,
-      radiusKmText: defaultSearchRadiusKmText,
+      lat: publicConfig.mapCenter.lat,
+      lon: publicConfig.mapCenter.lon,
+      radiusKmText: publicConfig.searchRadiusKmText,
     });
 
     let scanId = null;
@@ -1311,7 +1295,8 @@ async function startWorker(publicConfig, secretConfig) {
 
 function populateSetupForm(publicConfig, secretConfig) {
   document.getElementById("field-relays").value = publicConfig.relays.join("\n");
-  document.getElementById("field-source-feed-channels").value = publicConfig.trackedChannelIds.join("\n");
+  document.getElementById("field-map-center").value = `${publicConfig.mapCenter.lat},${publicConfig.mapCenter.lon}`;
+  document.getElementById("field-search-radius-km").value = publicConfig.searchRadiusKmText;
   document.getElementById("field-watch-channel-name").value = publicConfig.watchChannelName;
   document.getElementById("field-miniscord-url").value = publicConfig.miniscordUrl;
   document.getElementById("field-google-client-id").value = publicConfig.googleClientId;
@@ -1324,16 +1309,26 @@ function populateSetupForm(publicConfig, secretConfig) {
 }
 
 function readSetupForm() {
+  // "lat,lon" in one field, same convention as commands/commands-app.js's
+  // own area-scan center input - not split into two number inputs, so
+  // it's easy to paste straight from a Maps link. Invalid/incomplete text
+  // parses to NaN here and is caught by the submit handler's own check,
+  // same as a missing NSEC is.
+  const [mapCenterLat, mapCenterLon] = document
+    .getElementById("field-map-center")
+    .value.trim()
+    .split(",")
+    .map((s) => Number(s.trim()));
   const publicConfig = {
     relays: parseLines(document.getElementById("field-relays").value),
-    trackedChannelIds: parseLines(document.getElementById("field-source-feed-channels").value),
     watchChannelName: document.getElementById("field-watch-channel-name").value.trim(),
     miniscordUrl: document.getElementById("field-miniscord-url").value.trim(),
     googleClientId: document.getElementById("field-google-client-id").value.trim(),
     vapidPublicKey: document.getElementById("field-vapid-public").value.trim(),
     vapidContact: document.getElementById("field-vapid-contact").value.trim(),
     rememberSecrets: document.getElementById("field-remember-secrets").checked,
-    geofilterAnchor: { lat: 13.675873, lon: -89.281163 },
+    mapCenter: { lat: mapCenterLat, lon: mapCenterLon },
+    searchRadiusKmText: document.getElementById("field-search-radius-km").value.trim(),
   };
   const secretConfig = {
     nsec: document.getElementById("field-nsec").value.trim(),
@@ -1393,10 +1388,10 @@ function renderSetupScreen() {
   // startWorker() awaits a lot of network I/O (republishAllActive, etc.)
   // before the setup screen ever gets hidden below - a second click/Enter
   // in that window used to run the whole thing twice, standing up two
-  // independent SourceFeedConnector/NostrTransport/etc. instances that each
-  // registered their own bridgeChannel listeners, so every subsequent
-  // bridge message got handled (and logged) twice for the rest of the
-  // page's life. Guarded here since nothing downstream is idempotent to
+  // independent sets of connectors/transports that each registered their
+  // own listeners, so every subsequent event got handled (and logged)
+  // twice for the rest of the page's life. Guarded here since nothing
+  // downstream is idempotent to
   // being started more than once.
   let starting = false;
 
@@ -1417,6 +1412,22 @@ function renderSetupScreen() {
 
     if (!secretConfig.nsec) {
       errorEl.textContent = "Worker NSEC is required to start.";
+      errorEl.hidden = false;
+      starting = false;
+      submitButton.disabled = false;
+      statusEl.hidden = true;
+      return;
+    }
+    if (!Number.isFinite(publicConfig.mapCenter.lat) || !Number.isFinite(publicConfig.mapCenter.lon)) {
+      errorEl.textContent = 'Map center must be "lat,lon".';
+      errorEl.hidden = false;
+      starting = false;
+      submitButton.disabled = false;
+      statusEl.hidden = true;
+      return;
+    }
+    if (!publicConfig.searchRadiusKmText || !Number.isFinite(Number(publicConfig.searchRadiusKmText)) || Number(publicConfig.searchRadiusKmText) <= 0) {
+      errorEl.textContent = "Default search radius must be a positive number.";
       errorEl.hidden = false;
       starting = false;
       submitButton.disabled = false;

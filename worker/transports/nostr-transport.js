@@ -131,7 +131,7 @@ export class NostrTransport {
       // an equally-or-more-current copy of this same (kind, d) entity is
       // already on the relay, most often because republishAllActive()'s
       // startup resync raced a live re-observation of the same entity from
-      // the Source Feed bridge's own backlog rescan and lost. The data on the
+      // the scheduled loop's own first pass and lost. The data on the
       // relay is already correct either way; logging this at error level
       // would just be noise an operator has to learn to ignore.
       const allReplaced = reasonTexts.every(({ reason }) => /replaced:/i.test(reason));
