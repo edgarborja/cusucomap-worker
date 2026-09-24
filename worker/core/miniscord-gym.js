@@ -72,6 +72,12 @@ export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = ne
 
   const imageMatch = gym.raid.bossImageUrl?.match(BOSS_IMAGE_RE);
   const formCode = imageMatch?.[2] ?? null;
+  // eggImageUrl never carries a boss - it's the generic pre-hatch/rating
+  // icon (confirmed live: "raid_egg_<rating>_icon.png") - but Niantic
+  // marks a Shadow Raid by adding "_shadow" to that same filename
+  // ("raid_egg_<rating>_shadow_icon.png"), the only place this API says
+  // so at all (bossSpecies/bossImageUrl look identical either way).
+  const isShadow = Boolean(gym.raid.eggImageUrl?.includes("_shadow_"));
 
   let bossSpecies = gym.raid.bossSpecies;
   if (!bossSpecies || bossSpecies === UNKNOWN_BOSS_PLACEHOLDER) {
@@ -101,6 +107,7 @@ export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = ne
     moves: [],
     shinyEligible: false,
     gender: null,
+    isShadow,
     endsAt: new Date(gym.raid.endTime * 1000).toISOString(),
     cityRaw: null,
     scrapedAt: new Date().toISOString(),
