@@ -26,13 +26,26 @@ export function gymLocationKey(lat, lon) {
 // generic title, even once the boss is fully live (confirmed live for the
 // 2026-09-19 Mega Staraptor launch - every one of ~40 active mega raids in
 // the same city showed this same text). The real boss is only ever
-// conveyed by bossImageUrl's own filename: it follows Niantic's usual
-// asset convention "pm<dexNumber>.f<FORM>_<hash>.png", and dexNumber is
-// confirmed to be the boss's real National Pokédex number (398 = Staraptor,
-// verified against PokeAPI). Parsed here rather than hardcoded per-species
-// so a future mega boss needs no code change.
+// conveyed by bossImageUrl's own filename in that case, and dexNumber
+// there is confirmed to be the boss's real National Pokédex number
+// (398 = Staraptor, verified against PokeAPI).
+//
+// Every other raid's bossSpecies is already a normal, usable species name
+// - but it never distinguishes an alternate form: Hisuian Decidueye and
+// the regular one are both just "Decidueye" in bossSpecies; Thundurus's
+// Incarnate and Therian formes are both just "Thundurus". Only
+// bossImageUrl's own "f<FORM>" filename segment does that - confirmed
+// live: "pm642.fINCARNATE_<hash>.png", "pm724.fHISUIAN_<hash>.png",
+// "pm687.fMEGA_<hash>.png", vs. a plain "pm147_<hash>.png" for a species
+// with no alternate forms at all. Parsed here rather than hardcoded per
+// species/form, so a future boss/form needs no code change.
 const UNKNOWN_BOSS_PLACEHOLDER = "Pokémon Raid";
-const MEGA_BOSS_IMAGE_RE = /\/pm(\d+)\.f([A-Za-z]+)_/;
+const BOSS_IMAGE_RE = /\/pm(\d+)(?:\.f([A-Za-z]+))?_/;
+
+/** "HISUIAN" -> "Hisuian", "MEGA" -> "Mega" - matches this file's own long-standing "Mega" convention, generalized to every form code. */
+function titleCaseForm(formCode) {
+  return formCode.charAt(0).toUpperCase() + formCode.slice(1).toLowerCase();
+}
 
 /**
  * @param {object} gym - one element of miniscord's GET /gyms `results`
@@ -57,15 +70,16 @@ const MEGA_BOSS_IMAGE_RE = /\/pm(\d+)\.f([A-Za-z]+)_/;
 export async function buildRaidFromGym(gym, speciesCache, gymNameByLocation = new Map()) {
   if (!gym.raid) return null;
 
+  const imageMatch = gym.raid.bossImageUrl?.match(BOSS_IMAGE_RE);
+  const formCode = imageMatch?.[2] ?? null;
+
   let bossSpecies = gym.raid.bossSpecies;
-  let bossForm = null;
   if (!bossSpecies || bossSpecies === UNKNOWN_BOSS_PLACEHOLDER) {
-    const match = gym.raid.bossImageUrl?.match(MEGA_BOSS_IMAGE_RE);
-    if (!match || match[2].toUpperCase() !== "MEGA") return null;
-    bossSpecies = await resolveSpeciesNameByDexNumber(Number(match[1]), speciesCache);
+    if (!imageMatch || formCode?.toUpperCase() !== "MEGA") return null;
+    bossSpecies = await resolveSpeciesNameByDexNumber(Number(imageMatch[1]), speciesCache);
     if (!bossSpecies) return null;
-    bossForm = "Mega";
   }
+  const bossForm = formCode ? titleCaseForm(formCode) : null;
 
   const { lat, lon } = gym.location;
   const locationKey = gymLocationKey(lat, lon);

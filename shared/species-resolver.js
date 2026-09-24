@@ -86,7 +86,12 @@ export async function resolveSpecies(speciesRaw, cache = defaultCache) {
   // a slug with no hyphen to strip. Checks SPECIES_SEED first (cheap, no
   // network) before falling back to another PokeAPI fetch.
   if (unownLetter || !slug.includes("-")) return null;
-  const baseKey = slug.split("-")[0];
+  const segments = slug.split("-");
+  // "Mega X" normalizes to "mega-x" - stripping to the first segment would
+  // retry PokeAPI with "mega", which isn't a species. Use the second
+  // segment instead so a mega form falls back to its own base species
+  // ("mega-malamar" -> "malamar"), same as every other special/event form.
+  const baseKey = segments[0] === "mega" ? segments[1] : segments[0];
   const baseSeeded = SPECIES_SEED[baseKey];
   const fallback = baseSeeded
     ? { spriteUrl: `${SPRITE_BASE}${baseSeeded[0]}.png`, types: baseSeeded[1] }
